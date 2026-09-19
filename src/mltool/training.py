@@ -15,8 +15,8 @@ from uuid import uuid4
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
 
-from mltool.autogluon_adapter import AutoGluonAdapter, AutoGluonError
-from mltool.config import MLToolConfig
+from mltool.autogluon_adapter import AutoGluonAdapter, AutoGluonError, effective_model_seed
+from mltool.config import MLToolConfig, TrainingConfig
 from mltool.evaluation import EvaluationError, evaluate_predictions
 from mltool.experiment import CandidateSpec, ExperimentPlan, ExperimentError
 
@@ -169,8 +169,12 @@ def _prepare_candidate_frames(
     return train, validation_features, validation_target, conversion_applied
 
 
-def _candidate_failure(candidate: CandidateSpec, message: str) -> dict[str, Any]:
+def _candidate_failure(
+    candidate: CandidateSpec, message: str, training: TrainingConfig
+) -> dict[str, Any]:
     return {
+        "seed": training.seed,
+        "effective_seed": effective_model_seed(candidate.model, training),
         "candidate_id": candidate.candidate_id,
         "feature_set": candidate.feature_set.name,
         "feature_artifacts": {
@@ -232,6 +236,8 @@ def _train_candidate(
         "task": plan.config.task.type,
         "primary_metric": plan.config.evaluation.primary_metric,
         "metrics": metrics,
+        "seed": plan.config.training.seed,
+        "effective_seed": effective_model_seed(candidate.model, plan.config.training),
         "positive_class": output.positive_class,
         "target_conversion_applied": converted,
         "training_seconds": float(time.perf_counter() - started),
@@ -333,7 +339,7 @@ def train_experiment(
             except (TrainingError, AutoGluonError, EvaluationError) as exc:
                 # Candidate-specific failures are data/model failures, not matrix
                 # failures. Continue sequentially and persist a concise result.
-                result = _candidate_failure(candidate, str(exc))
+                result = _candidate_failure(candidate, str(exc), plan.config.training)
             (staging_candidate / "result.json").write_text(
                 json.dumps(result, indent=2, sort_keys=True, default=str) + "\n",
                 encoding="utf-8",
@@ -385,6 +391,13 @@ def train_experiment(
                 for model in plan.config.models
             ],
             "candidate_ids": [candidate.candidate_id for candidate in plan.candidates],
+            "seed": plan.config.training.seed,
+            "effective_seed": {
+                candidate.candidate_id: effective_model_seed(
+                    candidate.model, plan.config.training
+                )
+                for candidate in plan.candidates
+            },
             "successful_count": succeeded,
             "failed_count": len(candidate_results) - succeeded,
             "leaderboard": {

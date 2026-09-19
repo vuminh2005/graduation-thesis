@@ -49,6 +49,17 @@ FAMILY_SEED_KEYS = {
 NO_SEARCH_SPACE_FAMILIES = frozenset({"RF", "XT"})
 
 
+def effective_model_seed(model: ModelConfig, training: TrainingConfig) -> Any | None:
+    """The seed the model's own hyperparameters receive in ``fit``.
+
+    A seed fixed in the model's ``params`` wins over ``training.seed``.
+    """
+    params = dict(model.params)
+    if training.seed is not None:
+        params.setdefault(FAMILY_SEED_KEYS[model.family], training.seed)
+    return params.get(FAMILY_SEED_KEYS[model.family])
+
+
 class AutoGluonError(RuntimeError):
     """An expected candidate-level AutoGluon failure."""
 
@@ -117,6 +128,9 @@ class AutoGluonAdapter:
             predictor_kwargs["learner_kwargs"] = {"random_state": training.seed}
             # An explicitly fixed model seed in the config wins over training.seed.
             model_params.setdefault(FAMILY_SEED_KEYS[model.family], training.seed)
+        assert model_params.get(FAMILY_SEED_KEYS[model.family]) == effective_model_seed(
+            model, training
+        )
 
         fit_kwargs: dict[str, Any] = {
             "train_data": train_data.copy(deep=True),

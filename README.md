@@ -87,7 +87,12 @@ Bagging, stacking, weighted ensembles, GPUs, and test data stay off. Params you
 fix in a model's `params` stay fixed; the rest of AutoGluon's default search
 space is tuned. Families without a default AutoGluon search space (RF, XT) train once with
 default hyperparameters; `tune` warns about each such candidate and marks it
-`hpo_effective: false` in `result.json` and `selected.json`.
+`hpo_effective: false` (plus the `hpo_warning` text) in `result.json` and
+`selected.json`.
+
+Output goes to `.mltool/tuning/` (`candidates/`, `leaderboard.json/csv`,
+`manifest.json`, and `selected.json`, the best tuned configuration for a later
+final refit). `tuning-leaderboard` is read-only.
 
 Two different holdouts are involved. Inside each candidate, AutoGluon picks the
 winning trial on its own internal holdout carved from the train split.
@@ -101,10 +106,10 @@ Set `training.seed` (default `null`) to control randomness in both `train` and
 learner's `random_state` (internal holdout split) and as the model's own seed
 hyperparameter (`seed`, `random_state` or `random_seed` depending on family);
 a seed you fix in a model's `params` wins. When unset, AutoGluon's own default
-seed of 0 applies.
-Output goes to `.mltool/tuning/` (`candidates/`, `leaderboard.json/csv`,
-`manifest.json`, and `selected.json`, the best tuned configuration for a later
-final refit). `tuning-leaderboard` is read-only.
+seed of 0 applies. Training and tuning artifacts record `seed` (`training.seed`)
+and `effective_seed` (the seed the model's hyperparameters actually received,
+after any per-model override, or `null` when MLTool passed none; per candidate in `result.json`, keyed by candidate
+id in `manifest.json`).
 
 Changing the raw dataset invalidates prepared input and requires another
 `mltool prepare`. Phase 2 does not currently fingerprint external preprocessor

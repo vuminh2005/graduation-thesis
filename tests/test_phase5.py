@@ -252,7 +252,7 @@ def test_selected_json_is_the_best_tuned_candidate() -> None:
             "metrics": {"rmse": score}, "phase4_primary_score": 9.0,
             "feature_artifacts": {}, "positive_class": None,
             "autogluon_version": "x", "predictor_path": "p", "status": "SUCCEEDED",
-            "training_seconds": 1.0, "hpo_effective": True, "seed": None,
+            "training_seconds": 1.0, "hpo_effective": True, "hpo_warning": None, "seed": None, "effective_seed": None,
         }
 
     from mltool.training import build_leaderboard
@@ -450,3 +450,116 @@ def test_rf_candidates_are_flagged_as_not_tuned(tmp_path: Path) -> None:
         (tmp_path / ".mltool/tuning/candidates/base__forest/result.json").read_text()
     )
     assert stored["hpo_warning"] and stored["hpo_effective"] is False
+
+
+# --- audit-finding fixes: hpo_warning / effective_seed on artifacts -----------
+
+
+def seeded_project(root: Path, seed: int | None) -> Path:
+    models = [
+        {"name": "lightgbm", "family": "GBM", "params": {}},
+        {"name": "fixed", "family": "GBM", "params": {"seed": 99}},
+        {"name": "forest", "family": "RF", "params": {}},
+    ]
+    path = materialize(root, raw=project_config(models=models, training={"seed": seed}))
+    hpo_raw(path, top_n=3)
+    RecordingAdapter.failures = set()
+    train_experiment(build_experiment_plan(load_config(path)), adapter_factory=RecordingAdapter)
+    return path
+
+
+def test_effective_model_seed_reflects_override_and_family_key() -> None:
+    from mltool.autogluon_adapter import effective_model_seed
+
+    assert effective_model_seed(ModelConfig("m", "GBM", {}), TrainingConfig(None, 7)) == 7
+    assert effective_model_seed(ModelConfig("m", "GBM", {"seed": 99}), TrainingConfig(None, 7)) == 99
+    assert effective_model_seed(ModelConfig("m", "RF", {"seed": 99}), TrainingConfig(None, 7)) == 7
+    assert effective_model_seed(ModelConfig("m", "RF", {}), TrainingConfig(None, None)) is None
+    assert effective_model_seed(ModelConfig("m", "GBM", {"seed": 5}), TrainingConfig(None, None)) == 5
+
+
+def test_effective_seed_matches_what_fit_receives(tmp_path: Path) -> None:
+    from mltool.autogluon_adapter import FAMILY_SEED_KEYS, effective_model_seed
+
+    for params in ({}, {"seed": 99}):
+        model = ModelConfig("m", "GBM", params)
+        _, fit = seeded_call(tmp_path, "GBM", params, 7, None)
+        assert fit["hyperparameters"]["GBM"][FAMILY_SEED_KEYS["GBM"]] == effective_model_seed(
+            model, TrainingConfig(None, 7)
+        )
+
+
+def test_phase4_training_artifacts_record_seed_and_effective_seed(tmp_path: Path) -> None:
+    seeded_project(tmp_path, 7)
+    training = tmp_path / ".mltool/training"
+    lightgbm = json.loads((training / "candidates/base__lightgbm/result.json").read_text())
+    fixed = json.loads((training / "candidates/base__fixed/result.json").read_text())
+    forest = json.loads((training / "candidates/base__forest/result.json").read_text())
+    assert (lightgbm["seed"], lightgbm["effective_seed"]) == (7, 7)
+    assert (fixed["seed"], fixed["effective_seed"]) == (7, 99)
+    assert (forest["seed"], forest["effective_seed"]) == (7, 7)
+    manifest = json.loads((training / "manifest.json").read_text())
+    assert manifest["seed"] == 7
+    assert manifest["effective_seed"] == {
+        "base__lightgbm": 7, "base__fixed": 99, "base__forest": 7
+    }
+
+
+def test_phase4_failed_candidate_also_records_seed(tmp_path: Path) -> None:
+    path = materialize(
+        tmp_path, raw=project_config(models=MODELS, training={"seed": 3})
+    )
+    RecordingAdapter.failures = {"lightgbm"}
+    train_experiment(build_experiment_plan(load_config(path)), adapter_factory=RecordingAdapter)
+    RecordingAdapter.failures = set()
+    failed = json.loads((tmp_path / ".mltool/training/candidates/base__lightgbm/result.json").read_text())
+    assert failed["status"] == "FAILED" and (failed["seed"], failed["effective_seed"]) == (3, 3)
+
+
+def test_unset_seed_records_null_pair(tmp_path: Path) -> None:
+    trained_project(tmp_path)
+    result = json.loads((tmp_path / ".mltool/training/candidates/base__lightgbm/result.json").read_text())
+    assert result["seed"] is None and result["effective_seed"] is None
+
+
+def test_tuning_artifacts_record_effective_seed(tmp_path: Path) -> None:
+    path = seeded_project(tmp_path, 7)
+    plan = build_experiment_plan(load_config(path))
+    TuningAdapter.failures = set()
+    result = tune_experiment(plan, build_tuning_selection(plan), adapter_factory=TuningAdapter)
+    tuning = tmp_path / ".mltool/tuning"
+    stored = json.loads((tuning / "candidates/base__fixed/result.json").read_text())
+    assert (stored["seed"], stored["effective_seed"]) == (7, 99)
+    manifest = json.loads((tuning / "manifest.json").read_text())
+    assert manifest["seed"] == 7 and manifest["effective_seed"]["base__fixed"] == 99
+    selected = json.loads((tuning / "selected.json").read_text())
+    assert selected["seed"] == 7
+    assert selected["effective_seed"] == (99 if selected["candidate_id"] == "base__fixed" else 7)
+    assert result.selected is not None
+
+
+def test_selected_json_carries_hpo_warning_for_rf_only_project(tmp_path: Path) -> None:
+    path = materialize(
+        tmp_path,
+        raw=project_config(models=[{"name": "forest", "family": "RF", "params": {}}]),
+    )
+    hpo_raw(path, top_n=1)
+    train_experiment(build_experiment_plan(load_config(path)), adapter_factory=RecordingAdapter)
+    plan = build_experiment_plan(load_config(path))
+    tune_experiment(plan, build_tuning_selection(plan), adapter_factory=TuningAdapter)
+    selected = json.loads((tmp_path / ".mltool/tuning/selected.json").read_text())
+    assert selected["hpo_effective"] is False
+    assert "no default search space for family RF" in selected["hpo_warning"]
+
+
+def test_selected_json_hpo_warning_is_null_for_tunable_family(tmp_path: Path) -> None:
+    path = materialize(
+        tmp_path,
+        raw=project_config(models=[{"name": "lightgbm", "family": "GBM", "params": {}}]),
+    )
+    hpo_raw(path, top_n=1)
+    train_experiment(build_experiment_plan(load_config(path)), adapter_factory=RecordingAdapter)
+    plan = build_experiment_plan(load_config(path))
+    tune_experiment(plan, build_tuning_selection(plan), adapter_factory=TuningAdapter)
+    selected = json.loads((tmp_path / ".mltool/tuning/selected.json").read_text())
+    assert selected["hpo_effective"] is True and selected["hpo_warning"] is None

@@ -16,8 +16,9 @@ from mltool.autogluon_adapter import (
     NO_SEARCH_SPACE_FAMILIES,
     AutoGluonAdapter,
     AutoGluonError,
+    effective_model_seed,
 )
-from mltool.config import MLToolConfig
+from mltool.config import MLToolConfig, TrainingConfig
 from mltool.evaluation import EvaluationError, evaluate_predictions
 from mltool.experiment import CandidateSpec, ExperimentPlan
 from mltool.training import (
@@ -333,6 +334,7 @@ def _tune_candidate(
             "searcher": "random",
         },
         "seed": plan.config.training.seed,
+        "effective_seed": effective_model_seed(candidate.model, plan.config.training),
         "hpo_effective": candidate.model.family not in NO_SEARCH_SPACE_FAMILIES,
         "hpo_warning": (
             no_search_space_warning(candidate.model.family)
@@ -348,8 +350,10 @@ def _tune_candidate(
     }
 
 
-def _failure(candidate: CandidateSpec, message: str) -> dict[str, Any]:
+def _failure(candidate: CandidateSpec, message: str, training: TrainingConfig) -> dict[str, Any]:
     return {
+        "seed": training.seed,
+        "effective_seed": effective_model_seed(candidate.model, training),
         "candidate_id": candidate.candidate_id,
         "feature_set": candidate.feature_set.name,
         "feature_artifacts": {
@@ -385,7 +389,9 @@ def build_selected_configuration(
         "best_hyperparameters": result["best_hyperparameters"],
         "best_model": result["best_model"],
         "hpo_effective": result["hpo_effective"],
+        "hpo_warning": result["hpo_warning"],
         "seed": result["seed"],
+        "effective_seed": result["effective_seed"],
         "primary_metric": primary_metric,
         "tuned_validation_score": result["metrics"][primary_metric],
         "phase4_primary_score": result["phase4_primary_score"],
@@ -440,7 +446,7 @@ def tune_experiment(
                     adapter=adapter_factory(),
                 )
             except (TrainingError, AutoGluonError, EvaluationError) as exc:
-                result = _failure(candidate, str(exc))
+                result = _failure(candidate, str(exc), config.training)
             _write_json(staging_candidate / "result.json", result)
             candidate_results.append(result)
 
@@ -479,6 +485,10 @@ def tune_experiment(
                 "searcher": "random",
             },
             "seed": config.training.seed,
+            "effective_seed": {
+                candidate.candidate_id: effective_model_seed(candidate.model, config.training)
+                for candidate in selection.candidates
+            },
             "training_manifest": str(project_root / ".mltool/training/manifest.json"),
             "source_dataset_fingerprint": plan.feature_manifest.get("source_dataset_fingerprint"),
             "models": [
