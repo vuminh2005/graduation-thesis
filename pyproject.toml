@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "autogluon.tabular[lightgbm,catboost,xgboost]>=1.6,<1.7",
     "cloudpickle>=3,<4",
+    "mlflow>=3.0,<3.17",
     "pandas>=2.2,<3.0",
     "pyarrow>=23,<25",
     "PyYAML>=6,<7",

@@ -1,8 +1,9 @@
-"""Command-line entry points for MLTool Phases 1 through 6."""
+"""Command-line entry points for MLTool Phases 1 through 7."""
 
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import sys
 from pathlib import Path
@@ -34,7 +35,56 @@ from mltool.tuning import (
     load_persisted_tuning,
     tune_experiment,
 )
+from mltool import tracking
+from mltool.registry import RegistryError, register_final
+from mltool.reporting import render_best, render_logs, render_status
+from mltool.state import StateError, TrackedRun
 from mltool.validation import validate_dataset
+
+
+_CURRENT_RUN: list[TrackedRun] = []
+
+
+def _detail(**values: object) -> None:
+    """Attach details to the SQLite row of the command currently running."""
+    if _CURRENT_RUN:
+        _CURRENT_RUN[-1].details.update(values)
+
+
+def _warn_tracking(warning: str | None) -> None:
+    if warning:
+        print(f"Warning: {warning}", file=sys.stderr)
+
+
+def tracked(command: str):
+    """Record one SQLite ``runs`` row per invocation, whatever its outcome."""
+
+    def decorate(function):
+        @functools.wraps(function)
+        def wrapper(config_path: Path = Path("mltool.yaml"), *args, **kwargs) -> int:
+            root = Path(config_path).parent
+            run = TrackedRun(project_root=root, command=command)
+            _CURRENT_RUN.append(run)
+            try:
+                code = function(config_path, *args, **kwargs)
+            except BaseException as exc:
+                run.details.setdefault("error", str(exc))
+                run.finish("FAILED", 1)
+                raise
+            finally:
+                _CURRENT_RUN.pop()
+            if code == 0:
+                status = "SUCCEEDED"
+            elif run.details.get("blocked"):
+                status = "BLOCKED"
+            else:
+                status = "FAILED"
+            run.finish(status, code)
+            return code
+
+        return wrapper
+
+    return decorate
 
 
 CONFIG_TEMPLATE = '''schema_version: "0.1"
@@ -111,10 +161,20 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser("leaderboard", help="show the persisted global leaderboard")
     subparsers.add_parser("tune", help="run HPO on the top training candidates and select one")
     subparsers.add_parser("tuning-leaderboard", help="show the persisted tuning leaderboard")
-    subparsers.add_parser(
+    finalize = subparsers.add_parser(
         "finalize", help="refit the selected configuration on train+validation and test it"
     )
+    finalize.add_argument(
+        "--force",
+        action="store_true",
+        help="run again although a final model exists (evaluates the test split again)",
+    )
     subparsers.add_parser("final-result", help="show the persisted final model result")
+    subparsers.add_parser("register", help="copy .mltool/final into a new registry version")
+    subparsers.add_parser("status", help="show artifact freshness and last runs per phase")
+    logs = subparsers.add_parser("logs", help="show the recorded run history")
+    logs.add_argument("--limit", type=int, default=20, help="number of runs to show")
+    subparsers.add_parser("best", help="show the finalized and latest registered model")
     return parser
 
 
@@ -157,38 +217,46 @@ def _load_error_report(config: MLToolConfig, message: str) -> ValidationReport:
     return report
 
 
+@tracked("validate")
 def validate_project(config_path: Path = Path("mltool.yaml")) -> int:
     try:
         config = load_config(config_path)
     except ConfigError as exc:
+        _detail(error=str(exc))
         print(_config_error_report(str(exc)).render())
         return 2
 
     if not config.validation.enabled:
+        _detail(error="validation is disabled")
         print(_config_error_report('validation is disabled by "validation.enabled"').render())
         return 2
 
     try:
         dataset = load_dataset(config.data)
     except DataLoadError as exc:
+        _detail(error=str(exc))
         print(_load_error_report(config, str(exc)).render())
         return 2
 
     report = validate_dataset(config, dataset)
+    _detail(errors=len(report.errors), warnings=len(report.warnings))
     print(report.render())
     return 0 if report.is_valid else 2
 
 
+@tracked("prepare")
 def prepare_project(config_path: Path = Path("mltool.yaml")) -> int:
     try:
         config = load_config(config_path)
     except ConfigError as exc:
+        _detail(error=str(exc))
         print(render_preparation_error(str(exc)))
         return 2
 
     try:
         dataset = load_dataset(config.data)
     except DataLoadError as exc:
+        _detail(error=str(exc))
         print(render_preparation_error(str(exc)))
         return 2
 
@@ -196,6 +264,7 @@ def prepare_project(config_path: Path = Path("mltool.yaml")) -> int:
     # invalid dataset must never reach splitting or external preprocessing.
     validation_report = validate_dataset(config, dataset)
     if not validation_report.is_valid:
+        _detail(error="dataset validation failed", errors=len(validation_report.errors))
         print(validation_report.render())
         return 2
 
@@ -206,49 +275,73 @@ def prepare_project(config_path: Path = Path("mltool.yaml")) -> int:
             warning_messages=validation_report.warnings,
         )
     except PreparationError as exc:
+        _detail(error=str(exc))
         print(render_preparation_error(str(exc)))
         return 2
 
+    _detail(
+        train_rows=result.train_rows,
+        validation_rows=result.validation_rows,
+        test_rows=result.test_rows,
+    )
     print(result.render())
     return 0
 
 
+@tracked("features")
 def features_project(config_path: Path = Path("mltool.yaml")) -> int:
     try:
         config = load_config(config_path)
     except ConfigError as exc:
+        _detail(error=str(exc))
         print(render_feature_error(str(exc)))
         return 2
 
     try:
         result = materialize_feature_sets(config)
     except FeatureMaterializationError as exc:
+        _detail(error=str(exc))
         print(render_feature_error(str(exc)))
         return 2
 
+    _detail(feature_sets=[feature_set.name for feature_set in result.feature_sets])
     print(result.render())
     return 0
 
 
+@tracked("plan")
 def plan_project(config_path: Path = Path("mltool.yaml")) -> int:
     try:
         config = load_config(config_path)
         plan = build_experiment_plan(config)
     except (ConfigError, ExperimentError) as exc:
+        _detail(error=str(exc))
         print(render_experiment_error("MLTool training plan", str(exc)))
         return 2
+    _detail(candidates=len(plan.candidates), primary_metric=config.evaluation.primary_metric)
     print(plan.render())
     return 0
 
 
+@tracked("train")
 def train_project(config_path: Path = Path("mltool.yaml")) -> int:
     try:
         config = load_config(config_path)
         plan = build_experiment_plan(config)
         result = train_experiment(plan)
     except (ConfigError, ExperimentError, TrainingError) as exc:
+        _detail(error=str(exc))
         print(render_experiment_error("MLTool candidate training", str(exc)))
         return 2
+    run_ids, warning = tracking.log_training(config, result)
+    _warn_tracking(warning)
+    _detail(
+        candidates=len(getattr(result, "candidate_results", [])),
+        succeeded=getattr(result, "successful_count", None),
+        failed=getattr(result, "failed_count", None),
+        primary_metric=config.evaluation.primary_metric,
+        mlflow_runs=len(run_ids),
+    )
     print(result.render())
     return 0 if result.is_successful else 1
 
@@ -264,6 +357,7 @@ def leaderboard_project(config_path: Path = Path("mltool.yaml")) -> int:
     return 0
 
 
+@tracked("tune")
 def tune_project(config_path: Path = Path("mltool.yaml")) -> int:
     try:
         config = load_config(config_path)
@@ -271,8 +365,20 @@ def tune_project(config_path: Path = Path("mltool.yaml")) -> int:
         selection = build_tuning_selection(plan)
         result = tune_experiment(plan, selection)
     except (ConfigError, ExperimentError, TrainingError, TuningError) as exc:
+        _detail(error=str(exc))
         print(render_experiment_error("MLTool hyperparameter tuning", str(exc)))
         return 2
+    run_ids, warning = tracking.log_tuning(config, result)
+    _warn_tracking(warning)
+    selected = getattr(result, "selected", None)
+    _detail(
+        candidates=len(getattr(result, "candidate_results", [])),
+        succeeded=getattr(result, "successful_count", None),
+        failed=getattr(result, "failed_count", None),
+        primary_metric=config.evaluation.primary_metric,
+        selected_candidate_id=selected["candidate_id"] if selected else None,
+        mlflow_runs=len(run_ids),
+    )
     print(result.render())
     return 0 if result.is_successful else 1
 
@@ -288,15 +394,38 @@ def tuning_leaderboard_project(config_path: Path = Path("mltool.yaml")) -> int:
     return 0
 
 
-def finalize_project(config_path: Path = Path("mltool.yaml")) -> int:
+@tracked("finalize")
+def finalize_project(config_path: Path = Path("mltool.yaml"), force: bool = False) -> int:
+    _detail(forced=force)
+    existing = Path(config_path).parent / ".mltool" / "final" / "manifest.json"
+    if existing.is_file() and not force:
+        # Blocked before any work: the test split is evaluated once per final model.
+        message = (
+            "a final model already exists (.mltool/final/manifest.json). finalize evaluates "
+            "the test split and should run once; run \"mltool register\" to keep the current "
+            "result, then pass --force to refit and evaluate again"
+        )
+        _detail(blocked=True, error=message)
+        print(render_experiment_error("MLTool final model", message))
+        return 2
     try:
         config = load_config(config_path)
         plan = build_experiment_plan(config)
         finalize_input = load_finalize_input(plan)
         result = finalize_experiment(plan, finalize_input)
     except (ConfigError, ExperimentError, TrainingError, TuningError, FinalizeError) as exc:
+        _detail(error=str(exc))
         print(render_experiment_error("MLTool final model", str(exc)))
         return 2
+    run_ids, warning = tracking.log_final(config, result)
+    _warn_tracking(warning)
+    final = getattr(result, "result", {})
+    _detail(
+        candidate_id=final.get("candidate_id"),
+        primary_metric=config.evaluation.primary_metric,
+        test_metrics=final.get("metrics"),
+        mlflow_runs=len(run_ids),
+    )
     print(result.render())
     return 0
 
@@ -309,6 +438,50 @@ def final_result_project(config_path: Path = Path("mltool.yaml")) -> int:
         print(render_experiment_error("MLTool final result", str(exc)))
         return 2
     print(final.render())
+    return 0
+
+
+@tracked("register")
+def register_project(config_path: Path = Path("mltool.yaml")) -> int:
+    try:
+        config = load_config(config_path)
+        registered = register_final(config)
+    except (ConfigError, RegistryError) as exc:
+        _detail(error=str(exc))
+        print(render_experiment_error("MLTool model registry", str(exc)))
+        return 2
+    _detail(version=registered.version, candidate_id=registered.metadata["selected"]["candidate_id"])
+    print(registered.render())
+    return 0
+
+
+def status_project(config_path: Path = Path("mltool.yaml")) -> int:
+    try:
+        config = load_config(config_path)
+        print(render_status(config))
+    except (ConfigError, StateError) as exc:
+        print(render_experiment_error("MLTool status", str(exc)))
+        return 2
+    return 0
+
+
+def logs_project(config_path: Path = Path("mltool.yaml"), limit: int | None = 20) -> int:
+    try:
+        load_config(config_path)
+        print(render_logs(Path(config_path).parent, limit))
+    except (ConfigError, StateError) as exc:
+        print(render_experiment_error("MLTool run history", str(exc)))
+        return 2
+    return 0
+
+
+def best_project(config_path: Path = Path("mltool.yaml")) -> int:
+    try:
+        config = load_config(config_path)
+        print(render_best(config))
+    except (ConfigError, FinalizeError) as exc:
+        print(render_experiment_error("MLTool best configuration", str(exc)))
+        return 2
     return 0
 
 
@@ -334,8 +507,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "tuning-leaderboard":
             return tuning_leaderboard_project()
         if args.command == "finalize":
-            return finalize_project()
-        return final_result_project()
+            return finalize_project(force=args.force)
+        if args.command == "final-result":
+            return final_result_project()
+        if args.command == "register":
+            return register_project()
+        if args.command == "status":
+            return status_project()
+        if args.command == "logs":
+            return logs_project(limit=args.limit)
+        return best_project()
     except Exception as exc:  # Keep unexpected failures concise for CLI users.
         print(f"MLTool failed unexpectedly: {exc}", file=sys.stderr)
         return 1

@@ -27,6 +27,10 @@ mkdir demo && cd demo
 /path/to/graduation-thesis/.venv/bin/mltool tuning-leaderboard
 /path/to/graduation-thesis/.venv/bin/mltool finalize
 /path/to/graduation-thesis/.venv/bin/mltool final-result
+/path/to/graduation-thesis/.venv/bin/mltool register
+/path/to/graduation-thesis/.venv/bin/mltool status
+/path/to/graduation-thesis/.venv/bin/mltool logs
+/path/to/graduation-thesis/.venv/bin/mltool best
 ```
 
 Run `mltool validate` from the directory containing `mltool.yaml`; Phase 1 does
@@ -141,6 +145,36 @@ the config or the tuning selection has changed since `finalize`. The refit
 preprocessor and plugin states are not persisted, so the predictor alone cannot
 score raw data yet.
 
+`finalize` refuses to run when `.mltool/final/manifest.json` already exists,
+because every run evaluates the test split again. Run `mltool register` first
+to keep the current result, then pass `--force` to refit and evaluate again.
+
+Phase 7 adds tracking around the commands above; it never changes what they
+compute.
+
+- **Execution state** (`.mltool/state.db`, SQLite): one `runs` row per
+  `prepare`, `features`, `plan`, `train`, `tune`, `finalize` (including refused
+  ones, status `BLOCKED`) and `register`, with `started_at`, `finished_at`,
+  `status` (`SUCCEEDED`/`FAILED`/`BLOCKED`), `exit_code` and JSON `details`.
+  A command that created nothing (for example a first `validate`, or a failed
+  first `prepare`) does not create `.mltool/` just to log itself.
+- **MLflow** (`.mltool/mlflow`, local `file:` store; the project name is the
+  experiment): `train` logs one run per candidate, `tune` one per tuned
+  candidate (best hyperparameters as `hp.*` params), and a successful
+  `finalize` exactly one run (`test_*` metrics, `test_data_used=true`). Tracking
+  is best-effort: a failure prints a warning and never aborts the command.
+  MLflow's own Model Registry is not used, and MLflow >= 3.7 requires
+  `MLFLOW_ALLOW_FILE_STORE=true` for a file store, which MLTool sets for you.
+- **Registry** (`.mltool/registry/<n>/`): `register` copies `.mltool/final/`
+  (predictor, `preprocessor.pkl`, `feature_plugins/`, `result.json`,
+  `manifest.json`) into the next integer version and writes `metadata.json`
+  (timestamp, git commit when available, config fingerprint, selected
+  candidate, best hyperparameters, seeds, test metrics). Versions only grow, so
+  registering before each `finalize --force` keeps the history.
+- `status` shows per-phase artifact freshness and the last run of each command,
+  `logs [--limit N]` the run history (newest first), and `best` the finalized
+  model plus the latest registered version. None of them write anything.
+
 Changing the raw dataset invalidates prepared input and requires another
 `mltool prepare`. Phase 2 does not currently fingerprint external preprocessor
 source code, so changing that code also requires the user to rerun preparation.
@@ -150,6 +184,6 @@ configuration or dataset errors, and `1` for an unexpected runtime failure.
 
 MLTool currently includes Phase 1 validation, Phase 2 preparation, Phase 3
 feature materialization, and Phase 4 isolated candidate training/leaderboards.
-Phase 5 adds HPO on the top candidates and selection of one configuration, and
-Phase 6 refits that configuration on train+validation and evaluates it once on
-the test split.
+Phase 5 adds HPO on the top candidates and selection of one configuration, Phase 6 refits that configuration on train+validation and evaluates it on the
+test split, and Phase 7 adds SQLite run state, MLflow tracking and a local model
+registry.
