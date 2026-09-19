@@ -36,7 +36,7 @@ from mltool.tuning import (
     tune_experiment,
 )
 from mltool import tracking
-from mltool.registry import RegistryError, register_final
+from mltool.registry import RegistryBlocked, RegistryError, register_final
 from mltool.reporting import render_best, render_logs, render_status
 from mltool.state import StateError, TrackedRun
 from mltool.validation import validate_dataset
@@ -49,6 +49,29 @@ def _detail(**values: object) -> None:
     """Attach details to the SQLite row of the command currently running."""
     if _CURRENT_RUN:
         _CURRENT_RUN[-1].details.update(values)
+
+
+def _record_mlflow_runs(
+    config: MLToolConfig, phase_dir: str, keys: list[str], run_ids: list[str]
+) -> None:
+    """Best-effort trace file mapping each artifact to the MLflow run that logged it.
+
+    Written after the phase directory is committed; a failure is never fatal.
+    """
+    directory = config.config_path.parent / ".mltool" / phase_dir
+    if not run_ids or len(run_ids) != len(keys) or not directory.is_dir():
+        return
+    payload = {
+        "tracking_uri": tracking.tracking_uri(config.config_path.parent),
+        "experiment": tracking.experiment_name(config),
+        "runs": dict(zip(keys, run_ids)),
+    }
+    try:
+        (directory / "mlflow.json").write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    except OSError as exc:
+        print(f"Warning: could not record MLflow run ids: {exc}", file=sys.stderr)
 
 
 def _warn_tracking(warning: str | None) -> None:
@@ -170,7 +193,14 @@ def _parser() -> argparse.ArgumentParser:
         help="run again although a final model exists (evaluates the test split again)",
     )
     subparsers.add_parser("final-result", help="show the persisted final model result")
-    subparsers.add_parser("register", help="copy .mltool/final into a new registry version")
+    register = subparsers.add_parser(
+        "register", help="copy .mltool/final into a new registry version"
+    )
+    register.add_argument(
+        "--force",
+        action="store_true",
+        help="register although the final artifacts are stale (records the warning)",
+    )
     subparsers.add_parser("status", help="show artifact freshness and last runs per phase")
     logs = subparsers.add_parser("logs", help="show the recorded run history")
     logs.add_argument("--limit", type=int, default=20, help="number of runs to show")
@@ -370,6 +400,12 @@ def tune_project(config_path: Path = Path("mltool.yaml")) -> int:
         return 2
     run_ids, warning = tracking.log_tuning(config, result)
     _warn_tracking(warning)
+    _record_mlflow_runs(
+        config,
+        "tuning",
+        [r["candidate_id"] for r in getattr(result, "candidate_results", [])],
+        run_ids,
+    )
     selected = getattr(result, "selected", None)
     _detail(
         candidates=len(getattr(result, "candidate_results", [])),
@@ -420,6 +456,7 @@ def finalize_project(config_path: Path = Path("mltool.yaml"), force: bool = Fals
     run_ids, warning = tracking.log_final(config, result)
     _warn_tracking(warning)
     final = getattr(result, "result", {})
+    _record_mlflow_runs(config, "final", [final.get("candidate_id", "final")], run_ids)
     _detail(
         candidate_id=final.get("candidate_id"),
         primary_metric=config.evaluation.primary_metric,
@@ -442,15 +479,24 @@ def final_result_project(config_path: Path = Path("mltool.yaml")) -> int:
 
 
 @tracked("register")
-def register_project(config_path: Path = Path("mltool.yaml")) -> int:
+def register_project(config_path: Path = Path("mltool.yaml"), force: bool = False) -> int:
+    _detail(forced=force)
     try:
         config = load_config(config_path)
-        registered = register_final(config)
+        registered = register_final(config, force=force)
+    except RegistryBlocked as exc:
+        _detail(blocked=True, error=str(exc))
+        print(render_experiment_error("MLTool model registry", str(exc)))
+        return 2
     except (ConfigError, RegistryError) as exc:
         _detail(error=str(exc))
         print(render_experiment_error("MLTool model registry", str(exc)))
         return 2
-    _detail(version=registered.version, candidate_id=registered.metadata["selected"]["candidate_id"])
+    _detail(
+        version=registered.version,
+        candidate_id=registered.metadata["selected"]["candidate_id"],
+        stale_warning=registered.metadata["warning"],
+    )
     print(registered.render())
     return 0
 
@@ -511,7 +557,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "final-result":
             return final_result_project()
         if args.command == "register":
-            return register_project()
+            return register_project(force=args.force)
         if args.command == "status":
             return status_project()
         if args.command == "logs":

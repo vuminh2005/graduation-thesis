@@ -33,6 +33,7 @@ class PreparedFeatureInput:
     validation: pd.DataFrame
     test: pd.DataFrame
     source_fingerprint: str
+    artifacts_fingerprint: str
 
 
 @dataclass
@@ -113,11 +114,10 @@ def render_feature_error(message: str) -> str:
     )
 
 
-def _fingerprint(path: Path) -> str:
-    if not path.is_file():
-        raise FeatureMaterializationError(
-            f"configured source dataset was not found: {path}; run \"mltool prepare\" again"
-        )
+PREPARED_SPLITS = ("train", "validation", "test")
+
+
+def _sha256_file(path: Path, label: str) -> str:
     digest = hashlib.sha256()
     try:
         with path.open("rb") as stream:
@@ -125,8 +125,36 @@ def _fingerprint(path: Path) -> str:
                 digest.update(chunk)
     except OSError as exc:
         raise FeatureMaterializationError(
-            f"could not fingerprint configured source dataset {path}: {exc}"
+            f"could not fingerprint {label} {path}: {exc}"
         ) from exc
+    return digest.hexdigest()
+
+
+def _fingerprint(path: Path) -> str:
+    if not path.is_file():
+        raise FeatureMaterializationError(
+            f"configured source dataset was not found: {path}; run \"mltool prepare\" again"
+        )
+    return _sha256_file(path, "configured source dataset")
+
+
+def prepared_artifacts_fingerprint(prepared_path: Path) -> str:
+    """Fingerprint the Phase-2 outputs themselves, not just the raw dataset.
+
+    A changed split seed or ratio leaves the raw file untouched but rewrites
+    these parquet files, so feature artifacts built from a superseded
+    preparation can only be detected through their own bytes. The fitted
+    preprocessor is excluded: cloudpickle output is not byte-stable.
+    """
+    digest = hashlib.sha256()
+    for split_name in PREPARED_SPLITS:
+        path = prepared_path / f"{split_name}.parquet"
+        if not path.is_file():
+            raise FeatureMaterializationError(
+                f'prepared split is missing: {path}; run "mltool prepare" first'
+            )
+        digest.update(split_name.encode("utf-8"))
+        digest.update(_sha256_file(path, f"prepared {split_name} split").encode("utf-8"))
     return digest.hexdigest()
 
 
@@ -176,7 +204,7 @@ def load_prepared_feature_input(config: MLToolConfig) -> PreparedFeatureInput:
         )
 
     frames: dict[str, pd.DataFrame] = {}
-    for split_name in ("train", "validation", "test"):
+    for split_name in PREPARED_SPLITS:
         path = prepared_path / f"{split_name}.parquet"
         if not path.is_file():
             raise FeatureMaterializationError(
@@ -220,6 +248,7 @@ def load_prepared_feature_input(config: MLToolConfig) -> PreparedFeatureInput:
         validation=frames["validation"],
         test=frames["test"],
         source_fingerprint=prepared_fingerprint,
+        artifacts_fingerprint=prepared_artifacts_fingerprint(prepared_path),
     )
 
 
@@ -425,6 +454,7 @@ def materialize_feature_sets(config: MLToolConfig) -> FeatureMaterializationResu
                 "manifest": str(prepared.manifest_path),
             },
             "source_dataset_fingerprint": prepared.source_fingerprint,
+            "prepared_artifacts_fingerprint": prepared.artifacts_fingerprint,
             "task": {
                 "type": config.task.type,
                 "target": config.task.target,

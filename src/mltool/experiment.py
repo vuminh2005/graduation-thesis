@@ -11,6 +11,10 @@ from typing import Any
 import pandas as pd
 
 from mltool.config import FeatureSetConfig, MLToolConfig, ModelConfig
+from mltool.feature_materialization import (
+    FeatureMaterializationError,
+    prepared_artifacts_fingerprint,
+)
 
 
 class ExperimentError(ValueError):
@@ -129,6 +133,29 @@ def _current_source_fingerprint(config: MLToolConfig) -> str:
     return sha256_file(config.data.path)
 
 
+def _validate_prepared_provenance(
+    config: MLToolConfig, global_manifest: dict[str, Any]
+) -> None:
+    """The prepared artifacts these features were built from must still be the current ones.
+
+    Re-running ``prepare`` alone (a changed split seed or ratio) leaves the raw
+    dataset fingerprint intact, so without this every downstream phase would
+    keep trusting features derived from a superseded split.
+    """
+    recorded = global_manifest.get("prepared_artifacts_fingerprint")
+    if not isinstance(recorded, str) or not recorded:
+        # Written by older MLTool versions: provenance cannot be proven.
+        raise _stale(
+            "global feature manifest predates prepared-artifact fingerprinting"
+        )
+    try:
+        current = prepared_artifacts_fingerprint(config.config_path.parent / ".mltool/prepared")
+    except FeatureMaterializationError as exc:
+        raise ExperimentError(str(exc)) from exc
+    if recorded != current:
+        raise _stale("prepared artifacts changed after materialization")
+
+
 def _feature_set_entries(global_manifest: dict[str, Any]) -> list[dict[str, Any]]:
     entries = global_manifest.get("feature_sets")
     if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
@@ -228,6 +255,7 @@ def load_feature_artifacts(config: MLToolConfig) -> tuple[Path, dict[str, Any], 
     source_fingerprint = global_manifest.get("source_dataset_fingerprint")
     if source_fingerprint != _current_source_fingerprint(config):
         raise _stale("configured source dataset fingerprint changed")
+    _validate_prepared_provenance(config, global_manifest)
 
     entries = _feature_set_entries(global_manifest)
     configured_names = [spec.name for spec in config.features.sets]

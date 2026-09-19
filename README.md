@@ -65,7 +65,8 @@ FeatureSet artifacts and lineage manifests are written atomically under
 `.mltool/features/`.
 
 `plan` validates that the materialized FeatureSets still match the current
-dataset and feature configuration, then prints the deterministic FeatureSet ×
+dataset, the prepared artifacts they were built from, and the feature
+configuration, then prints the deterministic FeatureSet ×
 model Cartesian product without creating training output. `train` executes
 those candidates sequentially with AutoGluon Tabular on CPU. Every candidate
 receives only its FeatureSet train split during `fit`; MLTool predicts and
@@ -174,6 +175,32 @@ compute.
 - `status` shows per-phase artifact freshness and the last run of each command,
   `logs [--limit N]` the run history (newest first), and `best` the finalized
   model plus the latest registered version. None of them write anything.
+
+Feature artifacts are fingerprinted against `.mltool/prepared/`'s parquet files,
+not just against the raw dataset, so re-running `prepare` alone (a changed
+`split.random_seed` or ratio leaves the raw file untouched) marks them stale and
+`plan`, `train`, `tune` and `finalize` all refuse until `mltool features` is run
+again. `.mltool/prepared/` must therefore stay in place for those commands.
+
+**Migration note:** a project whose `.mltool/features/manifest.json` was written
+before this fingerprint existed reports "feature artifacts are stale ... predates
+prepared-artifact fingerprinting". Run `mltool features` once to re-materialize;
+nothing else needs changing.
+
+`finalize` records the fingerprints it relied on, so `final-result`, `best` and
+`status` report the final model as stale once the dataset, the prepared
+artifacts or the selected FeatureSet change underneath it, instead of printing a
+superseded test metric as current. `register` refuses a stale final model unless
+given `--force`, and a forced registration records the warning it overrode in
+`metadata.json` (never `null`) together with `forced: true`.
+
+`final-result` and `best` state whether the selected family was really tuned:
+families with no AutoGluon search space (RF, XT) print
+`Tuned: no (family RF has no HPO search space)`, and `hpo_effective` /
+`hpo_warning` are carried from `selected.json` into `.mltool/final/result.json`,
+its manifest, the registry `metadata.json` and the final MLflow run's tags.
+`tune` and `finalize` also write `mlflow.json` next to their artifacts, mapping
+each candidate to the MLflow run that recorded it.
 
 Changing the raw dataset invalidates prepared input and requires another
 `mltool prepare`. Phase 2 does not currently fingerprint external preprocessor

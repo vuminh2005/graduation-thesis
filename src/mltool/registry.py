@@ -22,6 +22,10 @@ class RegistryError(ValueError):
     """An expected registry precondition or artifact problem."""
 
 
+class RegistryBlocked(RegistryError):
+    """The final artifacts are stale; registering them needs an explicit --force."""
+
+
 @dataclass
 class RegisteredModel:
     version: int
@@ -89,7 +93,7 @@ def config_fingerprint(config: MLToolConfig) -> str:
     return hashlib.sha256(config.config_path.read_bytes()).hexdigest()
 
 
-def register_final(config: MLToolConfig) -> RegisteredModel:
+def register_final(config: MLToolConfig, *, force: bool = False) -> RegisteredModel:
     project_root = config.config_path.parent
     final = project_root / ".mltool" / "final"
     if not (final / "manifest.json").is_file() or not (final / "result.json").is_file():
@@ -98,6 +102,12 @@ def register_final(config: MLToolConfig) -> RegisteredModel:
         persisted = load_persisted_final(config)
     except FinalizeError as exc:
         raise RegistryError(str(exc)) from exc
+    if persisted.warning is not None and not force:
+        raise RegistryBlocked(
+            f"the final artifacts are stale ({persisted.warning}); registering them would "
+            'record a misleading model. Run "mltool finalize --force" to rebuild it, or pass '
+            "--force to register it anyway"
+        )
     result, manifest = persisted.result, persisted.manifest
 
     root = registry_path(project_root)
@@ -111,7 +121,7 @@ def register_final(config: MLToolConfig) -> RegisteredModel:
         for name in ("predictor", "feature_plugins"):
             if (final / name).is_dir():
                 shutil.copytree(final / name, staging / name)
-        for name in ("preprocessor.pkl", "result.json", "manifest.json"):
+        for name in ("preprocessor.pkl", "result.json", "manifest.json", "mlflow.json"):
             if (final / name).is_file():
                 shutil.copy2(final / name, staging / name)
         version = (max(list_versions(project_root), default=0)) + 1
@@ -124,6 +134,8 @@ def register_final(config: MLToolConfig) -> RegisteredModel:
             "source_dataset_fingerprint": manifest.get("source_dataset_fingerprint"),
             "selected": manifest["selected"],
             "best_hyperparameters": result["best_hyperparameters"],
+            "hpo_effective": result.get("hpo_effective"),
+            "hpo_warning": result.get("hpo_warning"),
             "seed": result.get("seed"),
             "effective_seed": result.get("effective_seed"),
             "primary_metric": result["primary_metric"],
@@ -131,6 +143,8 @@ def register_final(config: MLToolConfig) -> RegisteredModel:
             "selected_validation_score": result["selected_validation_score"],
             "autogluon_version": result.get("autogluon_version"),
             "artifacts": sorted([p.name for p in staging.iterdir()] + ["metadata.json"]),
+            "split": manifest.get("split"),
+            "forced": force,
             "warning": persisted.warning,
         }
         (staging / "metadata.json").write_text(

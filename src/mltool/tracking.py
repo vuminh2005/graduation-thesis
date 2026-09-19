@@ -193,7 +193,10 @@ def log_final(config: MLToolConfig, final: Any):
             "candidate_id": result["candidate_id"],
             "test_data_used": "true",
             "status": result["status"],
+            "hpo_effective": str(result.get("hpo_effective")).lower(),
         }
+        if result.get("hpo_warning"):
+            tags["hpo_warning"] = result["hpo_warning"]
         return [
             tracker.log_run(
                 run_name=f"final__{result['candidate_id']}",

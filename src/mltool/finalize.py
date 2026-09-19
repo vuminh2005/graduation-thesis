@@ -18,12 +18,13 @@ from mltool.config import MLToolConfig
 from mltool.data import DataLoadError, load_dataset
 from mltool.feature_plugins import FeaturePluginError
 from mltool.evaluation import EvaluationError, evaluate_predictions
-from mltool.experiment import ExperimentPlan, sha256_file
+from mltool.experiment import ExperimentError, ExperimentPlan, sha256_file
 from mltool.feature_materialization import (
     FeatureMaterializationError,
     _fingerprint,
     _read_manifest,
     build_feature_set_from_frames,
+    prepared_artifacts_fingerprint,
 )
 from mltool.preprocessing import PreprocessingError, preprocess_frames
 from mltool.splitting import SplitError, should_stratify, split_dataset
@@ -78,9 +79,11 @@ class FinalModelResult:
             f"  preprocessor refit: {'yes' if result['refit']['preprocessor']['enabled'] else 'disabled'}",
             f"  feature plugins refit: {', '.join(p['name'] for p in result['refit']['feature_plugins']) or 'none'}",
             f"  seed: {result['seed']}  effective_seed: {result['effective_seed']}",
-            "",
-            f"Test metrics ({result['rows']['test']} rows)",
         ]
+        tuned = tuned_line(result)
+        if tuned:
+            lines.append(f"  {tuned}")
+        lines.extend(["", f"Test metrics ({result['rows']['test']} rows)"])
         lines.extend(f"  {metric}={value:.6f}" for metric, value in result["metrics"].items())
         lines.extend(
             [
@@ -115,9 +118,11 @@ class PersistedFinal:
             f"({result['feature_set']} x {result['model']['name']} [{result['model']['family']}])",
             f"Best hyperparameters: {json.dumps(result['best_hyperparameters'], sort_keys=True)}",
             f"seed: {result['seed']}  effective_seed: {result['effective_seed']}",
-            "",
-            f"Test metrics ({result['rows']['test']} rows)",
         ]
+        tuned = tuned_line(result)
+        if tuned:
+            lines.append(tuned)
+        lines.extend(["", f"Test metrics ({result['rows']['test']} rows)"])
         lines.extend(f"  {metric}={value:.6f}" for metric, value in result["metrics"].items())
         lines.append(
             f"Tuned validation {result['primary_metric']}: "
@@ -127,6 +132,20 @@ class PersistedFinal:
             lines.extend(["", "Warnings", f"  ! {self.warning}"])
         lines.extend(["", "Test split: USED (evaluated once)"])
         return "\n".join(lines)
+
+
+def tuned_line(record: dict[str, Any]) -> str | None:
+    """One line stating whether the selected family was actually tuned.
+
+    ``None`` for artifacts written before this was recorded.
+    """
+    effective = record.get("hpo_effective")
+    if effective is None:
+        return None
+    if effective:
+        return "Tuned: yes"
+    family = record.get("model", {}).get("family", "?")
+    return f"Tuned: no (family {family} has no HPO search space)"
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -411,6 +430,8 @@ def finalize_experiment(
             "metrics": metrics,
             "selected_validation_score": selected["tuned_validation_score"],
             "best_hyperparameters": selected["best_hyperparameters"],
+            "hpo_effective": selected.get("hpo_effective"),
+            "hpo_warning": selected.get("hpo_warning"),
             "fit_hyperparameters": output.best_hyperparameters,
             "seed": config.training.seed,
             "effective_seed": selected.get("effective_seed"),
@@ -458,7 +479,11 @@ def finalize_experiment(
                 "feature_set": candidate.feature_set.name,
                 "model": result["model"],
                 "best_hyperparameters": selected["best_hyperparameters"],
+                "hpo_effective": selected.get("hpo_effective"),
+                "hpo_warning": selected.get("hpo_warning"),
             },
+            "hpo_effective": selected.get("hpo_effective"),
+            "hpo_warning": selected.get("hpo_warning"),
             "models": [
                 {"name": m.name, "family": m.family, "params": m.params} for m in config.models
             ],
@@ -469,6 +494,10 @@ def finalize_experiment(
             "source_dataset_fingerprint": finalize_input.prepared_manifest["source"][
                 "fingerprint"
             ],
+            "feature_artifacts": selected["feature_artifacts"],
+            "prepared_artifacts_fingerprint": prepared_artifacts_fingerprint(
+                project_root / ".mltool/prepared"
+            ),
             "tuning_manifest": str(project_root / ".mltool/tuning/manifest.json"),
             "tuning_selected": str(project_root / ".mltool/tuning/selected.json"),
             "artifacts": {
@@ -497,6 +526,45 @@ def finalize_experiment(
     )
 
 
+def _upstream_staleness(config: MLToolConfig, manifest: dict[str, Any]) -> str | None:
+    """Has anything this final model was built from changed since it was created?
+
+    Mirrors the depth of ``tune``'s check against ``train``: raw dataset, the
+    prepared artifacts, and the selected FeatureSet's own parquet bytes.
+    """
+    root = config.config_path.parent
+    try:
+        if manifest.get("source_dataset_fingerprint") != _fingerprint(config.data.path):
+            return "the configured source dataset changed after this final model was created"
+        recorded_prepared = manifest.get("prepared_artifacts_fingerprint")
+        if not isinstance(recorded_prepared, str) or not recorded_prepared:
+            return "this final model predates prepared-artifact fingerprinting"
+        if recorded_prepared != prepared_artifacts_fingerprint(root / ".mltool/prepared"):
+            return "the prepared artifacts changed after this final model was created"
+    except FeatureMaterializationError as exc:
+        return str(exc)
+
+    recorded_features = manifest.get("feature_artifacts")
+    if not isinstance(recorded_features, dict) or not recorded_features:
+        return "this final model predates feature-artifact fingerprinting"
+    selected = manifest.get("selected")
+    if not isinstance(selected, dict) or not isinstance(selected.get("feature_set"), str):
+        return "this final model's manifest is invalid"
+    set_path = root / ".mltool/features" / selected["feature_set"]
+    current: dict[str, Any] = {}
+    for split_name in ("train", "validation"):
+        path = set_path / f"{split_name}.parquet"
+        if not path.is_file():
+            return f"the selected FeatureSet artifact is missing: {path}"
+        try:
+            current[f"{split_name}_sha256"] = sha256_file(path)
+        except ExperimentError as exc:
+            return str(exc)
+    if current != recorded_features:
+        return "the selected FeatureSet was re-materialized after this final model was created"
+    return None
+
+
 def load_persisted_final(config: MLToolConfig) -> PersistedFinal:
     final_path = config.config_path.parent / ".mltool/final"
     manifest_path = final_path / "manifest.json"
@@ -521,7 +589,9 @@ def load_persisted_final(config: MLToolConfig) -> PersistedFinal:
         ],
         "models": manifest.get("models"),
     }
-    warning = None
+    warning = _upstream_staleness(config, manifest)
+    if warning is not None:
+        return PersistedFinal(manifest=manifest, result=result, warning=warning)
     if signature != _config_signature(config) or manifest.get("seed") != config.training.seed:
         warning = "current config differs from the config used to create this final model"
     else:

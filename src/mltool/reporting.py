@@ -13,6 +13,7 @@ from mltool.finalize import (
     _validate_prepared_manifest,
     load_finalize_input,
     load_persisted_final,
+    tuned_line,
 )
 from mltool.registry import RegistryError, list_versions, load_metadata
 from mltool.state import RunRecord, last_run_per_command, list_runs
@@ -152,6 +153,7 @@ def render_best(config: MLToolConfig) -> str:
                 "",
                 f"Latest registered version: {meta['version']} ({meta['registered_at']})",
                 f"  selected: {meta['selected']['candidate_id']}",
+                f"  {tuned_line({**meta, 'model': meta['selected']['model']}) or 'Tuned: unknown'}",
                 f"  test metrics: {metrics}",
                 f"  git commit: {meta['git_commit'] or 'n/a'}  registered versions: {len(versions)}",
             ]
