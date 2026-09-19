@@ -20,7 +20,7 @@ from mltool.autogluon_adapter import (
 )
 from mltool.config import MLToolConfig, TrainingConfig
 from mltool.evaluation import EvaluationError, evaluate_predictions
-from mltool.experiment import CandidateSpec, ExperimentPlan
+from mltool.experiment import CandidateSpec, ExperimentPlan, sha256_file
 from mltool.training import (
     TrainingError,
     _autogluon_version,
@@ -490,6 +490,9 @@ def tune_experiment(
                 for candidate in selection.candidates
             },
             "training_manifest": str(project_root / ".mltool/training/manifest.json"),
+            "training_manifest_sha256": sha256_file(
+                project_root / ".mltool/training/manifest.json"
+            ),
             "source_dataset_fingerprint": plan.feature_manifest.get("source_dataset_fingerprint"),
             "models": [
                 {"name": model.name, "family": model.family, "params": model.params}

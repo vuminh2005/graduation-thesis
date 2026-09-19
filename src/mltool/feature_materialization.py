@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 from pathlib import Path
@@ -16,8 +16,7 @@ import pandas as pd
 from mltool.config import FeaturePluginConfig, FeatureSetConfig, MLToolConfig
 from mltool.feature_plugins import (
     FeaturePluginError,
-    GeneratedFeatureFrames,
-    generate_features,
+    fit_and_generate_features,
 )
 
 
@@ -46,6 +45,7 @@ class MaterializedFeatureSet:
     rows: dict[str, int]
     frames: dict[str, pd.DataFrame]
     manifest: dict[str, Any]
+    fitted_plugins: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -225,10 +225,9 @@ def load_prepared_feature_input(config: MLToolConfig) -> PreparedFeatureInput:
 
 def _selected_source_columns(
     spec: FeatureSetConfig,
-    prepared: PreparedFeatureInput,
+    available: list[str],
     target: str,
 ) -> list[str]:
-    available = prepared.train.columns.tolist()
     if spec.source_columns == ["*"]:
         return [column for column in available if column != target]
     if target in spec.source_columns:
@@ -245,14 +244,15 @@ def _selected_source_columns(
 
 def _plugin_manifest(
     spec: FeaturePluginConfig,
-    generated: GeneratedFeatureFrames,
+    generated_columns: list[str],
+    resolved_entrypoint: str,
 ) -> dict[str, Any]:
     return {
         "name": spec.name,
         "entrypoint": spec.entrypoint,
-        "resolved_entrypoint": generated.resolved_entrypoint,
+        "resolved_entrypoint": resolved_entrypoint,
         "params": spec.params,
-        "generated_columns": generated.generated_columns,
+        "generated_columns": generated_columns,
     }
 
 
@@ -262,61 +262,77 @@ def _build_feature_set(
     spec: FeatureSetConfig,
     plugin_catalog: dict[str, FeaturePluginConfig],
 ) -> MaterializedFeatureSet:
+    return build_feature_set_from_frames(
+        config,
+        {"train": prepared.train, "validation": prepared.validation, "test": prepared.test},
+        "train",
+        spec,
+        plugin_catalog,
+    )
+
+
+def build_feature_set_from_frames(
+    config: MLToolConfig,
+    prepared_frames: dict[str, pd.DataFrame],
+    fit_split: str,
+    spec: FeatureSetConfig,
+    plugin_catalog: dict[str, FeaturePluginConfig],
+) -> MaterializedFeatureSet:
+    """Build one FeatureSet, fitting every plugin once on ``fit_split`` only.
+
+    Phase 3 fits on train; Phase 6 refits on train+validation. The plugin
+    instantiate/fit/transform contract is identical in both.
+    """
     target = config.task.target
-    source_columns = _selected_source_columns(spec, prepared, target)
-    prepared_frames = {
-        "train": prepared.train,
-        "validation": prepared.validation,
-        "test": prepared.test,
-    }
+    split_names = list(prepared_frames)
+    source_columns = _selected_source_columns(
+        spec, prepared_frames[fit_split].columns.tolist(), target
+    )
     base_frames = {
         split_name: frame.loc[:, source_columns].copy(deep=True)
         for split_name, frame in prepared_frames.items()
     }
-    generated_by_split: dict[str, list[pd.DataFrame]] = {
-        "train": [],
-        "validation": [],
-        "test": [],
-    }
+    generated_by_split: dict[str, list[pd.DataFrame]] = {name: [] for name in split_names}
     occupied_columns = set(source_columns)
     plugin_manifests: list[dict[str, Any]] = []
+    fitted_plugins: dict[str, Any] = {}
     lineage: dict[str, dict[str, str]] = {
         column: {"source": "base"} for column in source_columns
     }
 
     for plugin_name in spec.plugins:
         plugin_spec = plugin_catalog[plugin_name]
-        generated = generate_features(
+        generated_frames, generated_columns, resolved_entrypoint, fitted = fit_and_generate_features(
             plugin_spec,
             config_path=config.config_path,
             target=target,
-            train_base=base_frames["train"],
-            validation_base=base_frames["validation"],
-            test_base=base_frames["test"],
+            fit_split=fit_split,
+            base_frames=base_frames,
         )
         collisions = [
-            column
-            for column in generated.generated_columns
-            if column in occupied_columns
+            column for column in generated_columns if column in occupied_columns
         ]
         if collisions:
             raise FeatureMaterializationError(
                 f'feature plugin "{plugin_name}" generated colliding column '
                 f'"{collisions[0]}" in feature set "{spec.name}"'
             )
-        occupied_columns.update(generated.generated_columns)
-        for column in generated.generated_columns:
+        occupied_columns.update(generated_columns)
+        fitted_plugins[plugin_name] = fitted
+        for column in generated_columns:
             lineage[column] = {"source": "plugin", "plugin": plugin_name}
-        for split_name in ("train", "validation", "test"):
-            generated_by_split[split_name].append(getattr(generated, split_name))
-        plugin_manifests.append(_plugin_manifest(plugin_spec, generated))
+        for split_name in split_names:
+            generated_by_split[split_name].append(generated_frames[split_name])
+        plugin_manifests.append(
+            _plugin_manifest(plugin_spec, generated_columns, resolved_entrypoint)
+        )
 
     final_feature_columns = list(source_columns)
     for plugin_manifest in plugin_manifests:
         final_feature_columns.extend(plugin_manifest["generated_columns"])
 
     final_frames: dict[str, pd.DataFrame] = {}
-    for split_name in ("train", "validation", "test"):
+    for split_name in split_names:
         pieces = [base_frames[split_name], *generated_by_split[split_name]]
         features = pd.concat(pieces, axis=1)
         if features.columns.tolist() != final_feature_columns:
@@ -328,11 +344,11 @@ def _build_feature_set(
         result[target] = prepared_frames[split_name][target].copy(deep=True)
         final_frames[split_name] = result
 
-    expected_schema = final_frames["train"].columns.tolist()
-    for split_name in ("validation", "test"):
+    expected_schema = final_frames[fit_split].columns.tolist()
+    for split_name in split_names:
         if final_frames[split_name].columns.tolist() != expected_schema:
             raise FeatureMaterializationError(
-                f'feature set "{spec.name}" final train/{split_name} schemas differ'
+                f'feature set "{spec.name}" final {fit_split}/{split_name} schemas differ'
             )
 
     rows = {split_name: len(frame) for split_name, frame in final_frames.items()}
@@ -354,6 +370,7 @@ def _build_feature_set(
         rows=rows,
         frames=final_frames,
         manifest=manifest,
+        fitted_plugins=fitted_plugins,
     )
 
 

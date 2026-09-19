@@ -138,6 +138,19 @@ def _autogluon_version() -> str:
         return "unknown"
 
 
+def convert_regression_targets(frames: dict[str, pd.DataFrame], target: str) -> bool:
+    """Strictly convert regression targets to numeric in place; True if any changed dtype."""
+    applied = not all(is_numeric_dtype(frame[target]) for frame in frames.values())
+    try:
+        for frame in frames.values():
+            frame[target] = pd.to_numeric(frame[target], errors="raise")
+    except (TypeError, ValueError) as exc:
+        raise TrainingError(
+            f'regression target "{target}" cannot be converted strictly to numeric data: {exc}'
+        ) from exc
+    return applied
+
+
 def _prepare_candidate_frames(
     plan: ExperimentPlan,
     candidate: CandidateSpec,
@@ -154,16 +167,9 @@ def _prepare_candidate_frames(
     validation = validation.copy(deep=True)
     conversion_applied = False
     if plan.config.task.type == "regression":
-        conversion_applied = not (
-            is_numeric_dtype(train[target]) and is_numeric_dtype(validation[target])
-        )
-        try:
-            train[target] = pd.to_numeric(train[target], errors="raise")
-            validation[target] = pd.to_numeric(validation[target], errors="raise")
-        except (TypeError, ValueError) as exc:
-            raise TrainingError(
-                f'regression target "{target}" cannot be converted strictly to numeric data: {exc}'
-            ) from exc
+        frames = {"train": train, "validation": validation}
+        conversion_applied = convert_regression_targets(frames, target)
+        train, validation = frames["train"], frames["validation"]
     validation_target = validation[target].copy(deep=True)
     validation_features = validation.drop(columns=[target]).copy(deep=True)
     return train, validation_features, validation_target, conversion_applied

@@ -1,4 +1,4 @@
-"""Command-line entry points for MLTool Phases 1 through 5."""
+"""Command-line entry points for MLTool Phases 1 through 6."""
 
 from __future__ import annotations
 
@@ -21,6 +21,12 @@ from mltool.experiment import (
 )
 from mltool.preparation import PreparationError, prepare_dataset, render_preparation_error
 from mltool.report import DatasetSummary, ValidationReport
+from mltool.finalize import (
+    FinalizeError,
+    finalize_experiment,
+    load_finalize_input,
+    load_persisted_final,
+)
 from mltool.training import TrainingError, load_persisted_leaderboard, train_experiment
 from mltool.tuning import (
     TuningError,
@@ -105,6 +111,10 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser("leaderboard", help="show the persisted global leaderboard")
     subparsers.add_parser("tune", help="run HPO on the top training candidates and select one")
     subparsers.add_parser("tuning-leaderboard", help="show the persisted tuning leaderboard")
+    subparsers.add_parser(
+        "finalize", help="refit the selected configuration on train+validation and test it"
+    )
+    subparsers.add_parser("final-result", help="show the persisted final model result")
     return parser
 
 
@@ -278,6 +288,30 @@ def tuning_leaderboard_project(config_path: Path = Path("mltool.yaml")) -> int:
     return 0
 
 
+def finalize_project(config_path: Path = Path("mltool.yaml")) -> int:
+    try:
+        config = load_config(config_path)
+        plan = build_experiment_plan(config)
+        finalize_input = load_finalize_input(plan)
+        result = finalize_experiment(plan, finalize_input)
+    except (ConfigError, ExperimentError, TrainingError, TuningError, FinalizeError) as exc:
+        print(render_experiment_error("MLTool final model", str(exc)))
+        return 2
+    print(result.render())
+    return 0
+
+
+def final_result_project(config_path: Path = Path("mltool.yaml")) -> int:
+    try:
+        config = load_config(config_path)
+        final = load_persisted_final(config)
+    except (ConfigError, FinalizeError) as exc:
+        print(render_experiment_error("MLTool final result", str(exc)))
+        return 2
+    print(final.render())
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -297,7 +331,11 @@ def main(argv: list[str] | None = None) -> int:
             return leaderboard_project()
         if args.command == "tune":
             return tune_project()
-        return tuning_leaderboard_project()
+        if args.command == "tuning-leaderboard":
+            return tuning_leaderboard_project()
+        if args.command == "finalize":
+            return finalize_project()
+        return final_result_project()
     except Exception as exc:  # Keep unexpected failures concise for CLI users.
         print(f"MLTool failed unexpectedly: {exc}", file=sys.stderr)
         return 1

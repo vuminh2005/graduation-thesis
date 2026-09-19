@@ -140,44 +140,47 @@ def _transform_one(
     return transformed.copy(deep=True)
 
 
-def preprocess_splits(
-    splits: DatasetSplits,
+@dataclass
+class PreprocessedFrames:
+    frames: dict[str, pd.DataFrame]
+    fitted_preprocessor: Any | None = None
+    preprocessor_name: str | None = None
+    resolved_entrypoint: str | None = None
+
+
+def preprocess_frames(
+    frames: dict[str, pd.DataFrame],
     *,
+    fit_split: str,
     target: str,
     config: ExternalPreprocessingConfig,
     config_path: Path,
-) -> PreprocessedSplits:
+) -> PreprocessedFrames:
+    """Fit the external preprocessor once on ``fit_split`` and transform every frame.
+
+    Shared by Phase 2 (fit on train) and Phase 6 (refit on train+validation).
+    """
     if not config.enabled:
-        return PreprocessedSplits(
-            train=splits.train.copy(deep=True),
-            validation=splits.validation.copy(deep=True),
-            test=splits.test.copy(deep=True),
+        return PreprocessedFrames(
+            frames={name: frame.copy(deep=True) for name, frame in frames.items()}
         )
 
     preprocessor, class_name, resolved_entrypoint = load_external_preprocessor(
         config, config_path
     )
-    features = {
-        "train": splits.train.drop(columns=[target]),
-        "validation": splits.validation.drop(columns=[target]),
-        "test": splits.test.drop(columns=[target]),
-    }
-    targets = {
-        "train": splits.train[target].copy(deep=True),
-        "validation": splits.validation[target].copy(deep=True),
-        "test": splits.test[target].copy(deep=True),
-    }
+    features = {name: frame.drop(columns=[target]) for name, frame in frames.items()}
+    targets = {name: frame[target].copy(deep=True) for name, frame in frames.items()}
 
-    # The only fit call in Phase 2 receives a defensive copy of train features.
+    # The only fit call receives a defensive copy of the fit split's features.
     try:
-        preprocessor.fit(features["train"].copy(deep=True))
+        preprocessor.fit(features[fit_split].copy(deep=True))
     except (Exception, SystemExit) as exc:
         raise PreprocessingError(
-            f'external preprocessor "{class_name}" fit failed on train features: {exc}'
+            f'external preprocessor "{class_name}" fit failed on {fit_split} features: {exc}'
         ) from exc
 
     prepared: dict[str, pd.DataFrame] = {}
-    for split_name in ("train", "validation", "test"):
+    for split_name in frames:
         transformed = _transform_one(
             preprocessor,
             features[split_name],
@@ -187,11 +190,33 @@ def preprocess_splits(
         transformed[target] = targets[split_name]
         prepared[split_name] = transformed
 
-    return PreprocessedSplits(
-        train=prepared["train"],
-        validation=prepared["validation"],
-        test=prepared["test"],
+    return PreprocessedFrames(
+        frames=prepared,
         fitted_preprocessor=preprocessor,
         preprocessor_name=class_name,
         resolved_entrypoint=resolved_entrypoint,
+    )
+
+
+def preprocess_splits(
+    splits: DatasetSplits,
+    *,
+    target: str,
+    config: ExternalPreprocessingConfig,
+    config_path: Path,
+) -> PreprocessedSplits:
+    result = preprocess_frames(
+        {"train": splits.train, "validation": splits.validation, "test": splits.test},
+        fit_split="train",
+        target=target,
+        config=config,
+        config_path=config_path,
+    )
+    return PreprocessedSplits(
+        train=result.frames["train"],
+        validation=result.frames["validation"],
+        test=result.frames["test"],
+        fitted_preprocessor=result.fitted_preprocessor,
+        preprocessor_name=result.preprocessor_name,
+        resolved_entrypoint=result.resolved_entrypoint,
     )

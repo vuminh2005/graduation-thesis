@@ -75,6 +75,22 @@ class AutoGluonOutput:
     best_hyperparameters: dict[str, Any] | None = None
 
 
+def _check_trained_models(trained_models: list[str], family: str) -> None:
+    if not trained_models:
+        raise AutoGluonError("AutoGluon did not train a usable model")
+    if any("WeightedEnsemble" in name for name in trained_models):
+        raise AutoGluonError("AutoGluon unexpectedly trained a weighted ensemble")
+    expected_tokens = FAMILY_MODEL_TOKENS[family]
+    unrelated = [
+        name for name in trained_models if not any(token in name for token in expected_tokens)
+    ]
+    if unrelated:
+        raise AutoGluonError(
+            "AutoGluon unexpectedly trained models outside family "
+            f'{family}: {", ".join(unrelated)}'
+        )
+
+
 def _best_hyperparameters(predictor: Any, model_name: str) -> dict[str, Any]:
     info = predictor.info()["model_info"][model_name]
     return dict(info.get("hyperparameters", {}))
@@ -185,19 +201,7 @@ class AutoGluonAdapter:
             raise AutoGluonError("AutoGluon returned the wrong number of validation predictions")
         if probabilities is not None and len(probabilities) != len(validation_features):
             raise AutoGluonError("AutoGluon returned the wrong number of probability rows")
-        if not trained_models:
-            raise AutoGluonError("AutoGluon did not train a usable model")
-        if any("WeightedEnsemble" in name for name in trained_models):
-            raise AutoGluonError("AutoGluon unexpectedly trained a weighted ensemble")
-        expected_tokens = FAMILY_MODEL_TOKENS[model.family]
-        unrelated = [
-            name for name in trained_models if not any(token in name for token in expected_tokens)
-        ]
-        if unrelated:
-            raise AutoGluonError(
-                "AutoGluon unexpectedly trained models outside family "
-                f'{model.family}: {", ".join(unrelated)}'
-            )
+        _check_trained_models(trained_models, model.family)
 
         resolved_positive = None
         if task.type == "binary":
@@ -210,4 +214,93 @@ class AutoGluonAdapter:
             autogluon_version=self._version_resolver(),
             best_model=best_model,
             best_hyperparameters=best_hyperparameters,
+        )
+
+    def fit_final(
+        self,
+        *,
+        train_data: pd.DataFrame,
+        test_features: pd.DataFrame,
+        task: TaskConfig,
+        model: ModelConfig,
+        best_hyperparameters: dict[str, Any],
+        effective_seed: int | None,
+        primary_metric: str,
+        predictor_path: Path,
+        training: TrainingConfig,
+    ) -> AutoGluonOutput:
+        """Phase 6: one fixed-hyperparameter fit, then exactly one inference call.
+
+        No HPO. ``refit_full`` retrains the single fitted model on every provided
+        row (AutoGluon otherwise keeps an internal holdout out of a non-bagged fit)
+        with the same hyperparameters, and makes it the predictor's best model.
+        """
+        predictor_kwargs: dict[str, Any] = {
+            "label": task.target,
+            "problem_type": task.type,
+            "eval_metric": AUTOGLUON_METRICS[primary_metric],
+            "path": str(predictor_path),
+            "verbosity": 2,
+        }
+        if task.type == "binary" and task.positive_class is not None:
+            predictor_kwargs["positive_class"] = task.positive_class
+        if training.seed is not None:
+            predictor_kwargs["learner_kwargs"] = {"random_state": training.seed}
+        params = dict(best_hyperparameters)
+        if effective_seed is not None:
+            params[FAMILY_SEED_KEYS[model.family]] = effective_seed
+
+        fit_kwargs: dict[str, Any] = {
+            "train_data": train_data.copy(deep=True),
+            "hyperparameters": {model.family: params},
+            "hyperparameter_tune_kwargs": None,
+            "fit_weighted_ensemble": False,
+            "fit_full_last_level_weighted_ensemble": False,
+            "full_weighted_ensemble_additionally": False,
+            "num_bag_folds": 0,
+            "num_stack_levels": 0,
+            "dynamic_stacking": False,
+            "num_gpus": 0,
+            "fit_strategy": "sequential",
+            "refit_full": True,
+            "set_best_to_refit_full": True,
+        }
+        if training.time_limit_seconds is not None:
+            fit_kwargs["time_limit"] = training.time_limit_seconds
+
+        try:
+            predictor = self._factory()(**predictor_kwargs)
+            predictor.fit(**fit_kwargs)
+            trained_models = list(predictor.model_names())
+            _check_trained_models(trained_models, model.family)
+            frame = test_features.copy(deep=True)
+            probabilities = None
+            if task.type in {"binary", "multiclass"}:
+                probabilities = predictor.predict_proba(frame, as_multiclass=True)
+                predictions = predictor.predict_from_proba(probabilities)
+            else:
+                predictions = predictor.predict(frame)
+            best_model = str(predictor.model_best)
+        except (Exception, SystemExit) as exc:
+            raise AutoGluonError(str(exc)) from exc
+
+        if not isinstance(predictions, pd.Series):
+            predictions = pd.Series(predictions, index=test_features.index)
+        if probabilities is not None and not isinstance(probabilities, pd.DataFrame):
+            probabilities = pd.DataFrame(probabilities, index=test_features.index)
+        if len(predictions) != len(test_features) or (
+            probabilities is not None and len(probabilities) != len(test_features)
+        ):
+            raise AutoGluonError("AutoGluon returned the wrong number of test predictions")
+        resolved_positive = None
+        if task.type == "binary":
+            resolved_positive = getattr(predictor, "positive_class", task.positive_class)
+        return AutoGluonOutput(
+            predictions=predictions.copy(deep=True),
+            probabilities=probabilities.copy(deep=True) if probabilities is not None else None,
+            positive_class=resolved_positive,
+            trained_models=trained_models,
+            autogluon_version=self._version_resolver(),
+            best_model=best_model,
+            best_hyperparameters=params,
         )

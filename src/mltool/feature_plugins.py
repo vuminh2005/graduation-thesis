@@ -147,6 +147,48 @@ def _transform(
     return generated.copy(deep=True)
 
 
+def fit_and_generate_features(
+    spec: FeaturePluginConfig,
+    *,
+    config_path: Path,
+    target: str,
+    fit_split: str,
+    base_frames: dict[str, pd.DataFrame],
+) -> tuple[dict[str, pd.DataFrame], list[str], str, Any]:
+    """Instantiate, fit once on ``fit_split``, and transform every base frame.
+
+    Shared by Phase 3 (fit on train) and Phase 6 (refit on train+validation).
+    The fitted plugin instance is returned so Phase 6 can persist its state.
+    """
+    plugin, resolved_entrypoint = load_feature_plugin(spec, config_path)
+    try:
+        plugin.fit(base_frames[fit_split].copy(deep=True))
+    except (Exception, SystemExit) as exc:
+        raise FeaturePluginError(
+            f'feature plugin "{spec.name}" fit failed on {fit_split} features: {exc}'
+        ) from exc
+
+    frames = {
+        split_name: _transform(
+            plugin,
+            base,
+            plugin_name=spec.name,
+            split_name=split_name,
+            target=target,
+        )
+        for split_name, base in base_frames.items()
+    }
+    expected_columns = frames[fit_split].columns.tolist()
+    for split_name, generated in frames.items():
+        actual_columns = generated.columns.tolist()
+        if actual_columns != expected_columns:
+            raise FeaturePluginError(
+                f'feature plugin "{spec.name}" generated inconsistent columns: '
+                f"{fit_split} has {expected_columns!r}, {split_name} has {actual_columns!r}"
+            )
+    return frames, expected_columns, resolved_entrypoint, plugin
+
+
 def generate_features(
     spec: FeaturePluginConfig,
     *,
@@ -156,50 +198,17 @@ def generate_features(
     validation_base: pd.DataFrame,
     test_base: pd.DataFrame,
 ) -> GeneratedFeatureFrames:
-    plugin, resolved_entrypoint = load_feature_plugin(spec, config_path)
-    try:
-        plugin.fit(train_base.copy(deep=True))
-    except (Exception, SystemExit) as exc:
-        raise FeaturePluginError(
-            f'feature plugin "{spec.name}" fit failed on train features: {exc}'
-        ) from exc
-
-    frames = {
-        "train": _transform(
-            plugin,
-            train_base,
-            plugin_name=spec.name,
-            split_name="train",
-            target=target,
-        ),
-        "validation": _transform(
-            plugin,
-            validation_base,
-            plugin_name=spec.name,
-            split_name="validation",
-            target=target,
-        ),
-        "test": _transform(
-            plugin,
-            test_base,
-            plugin_name=spec.name,
-            split_name="test",
-            target=target,
-        ),
-    }
-    expected_columns = frames["train"].columns.tolist()
-    for split_name in ("validation", "test"):
-        actual_columns = frames[split_name].columns.tolist()
-        if actual_columns != expected_columns:
-            raise FeaturePluginError(
-                f'feature plugin "{spec.name}" generated inconsistent columns: '
-                f"train has {expected_columns!r}, {split_name} has {actual_columns!r}"
-            )
+    frames, columns, resolved_entrypoint, _ = fit_and_generate_features(
+        spec,
+        config_path=config_path,
+        target=target,
+        fit_split="train",
+        base_frames={"train": train_base, "validation": validation_base, "test": test_base},
+    )
     return GeneratedFeatureFrames(
         train=frames["train"],
         validation=frames["validation"],
         test=frames["test"],
-        generated_columns=expected_columns,
+        generated_columns=columns,
         resolved_entrypoint=resolved_entrypoint,
     )
-

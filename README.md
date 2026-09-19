@@ -25,6 +25,8 @@ mkdir demo && cd demo
 /path/to/graduation-thesis/.venv/bin/mltool leaderboard
 /path/to/graduation-thesis/.venv/bin/mltool tune
 /path/to/graduation-thesis/.venv/bin/mltool tuning-leaderboard
+/path/to/graduation-thesis/.venv/bin/mltool finalize
+/path/to/graduation-thesis/.venv/bin/mltool final-result
 ```
 
 Run `mltool validate` from the directory containing `mltool.yaml`; Phase 1 does
@@ -69,7 +71,7 @@ candidate represents exactly one configured family.
 
 Training artifacts live under `.mltool/training/`, including one predictor and
 result per candidate plus JSON/CSV global leaderboards. `leaderboard` is
-read-only. Phase 4 never loads or evaluates FeatureSet `test.parquet` files.
+read-only. Phases 4 and 5 never load or evaluate FeatureSet `test.parquet` files.
 
 `tune` (Phase 5) needs an optional `hpo:` section, which `init` does not write:
 
@@ -111,6 +113,34 @@ and `effective_seed` (the seed the model's hyperparameters actually received,
 after any per-model override, or `null` when MLTool passed none; per candidate in `result.json`, keyed by candidate
 id in `manifest.json`).
 
+`finalize` (Phase 6) is the only command that evaluates on the test split. It
+reads `.mltool/tuning/selected.json` and refuses to run if the tuning, training,
+feature or prepared artifacts are missing or stale relative to the current
+config. It then:
+
+1. re-runs the Phase 2 split on the raw dataset (same seed and stratification)
+   and checks the row counts against the prepared manifest (train+validation
+   and test), failing if they differ;
+2. combines the raw train and validation rows, refits the external preprocessor
+   on them only, and transforms both the combined rows and the test rows;
+3. refits only the selected FeatureSet's plugins on the combined rows with the
+   same instantiate/fit/transform contract as `features`;
+4. runs one AutoGluon fit of the selected family with `best_hyperparameters`
+   fixed (no HPO, no bagging/stacking/weighted ensemble, no GPU) and the
+   selected candidate's `effective_seed`;
+5. predicts on the test rows once and computes the configured metrics.
+
+A non-bagged AutoGluon fit keeps an internal holdout out of training, so
+`finalize` passes `refit_full`: the same model is retrained with the same
+hyperparameters on every combined row and becomes the predictor's best model
+(`LightGBM_FULL`, for example). It reads the raw dataset, never the persisted
+`.mltool/features/*/test.parquet`. Output goes to `.mltool/final/`
+(`predictor/`, `result.json`, `manifest.json`); its manifest is the only one
+that records `test_data_used: true`. `final-result` is read-only and warns when
+the config or the tuning selection has changed since `finalize`. The refit
+preprocessor and plugin states are not persisted, so the predictor alone cannot
+score raw data yet.
+
 Changing the raw dataset invalidates prepared input and requires another
 `mltool prepare`. Phase 2 does not currently fingerprint external preprocessor
 source code, so changing that code also requires the user to rerun preparation.
@@ -120,5 +150,6 @@ configuration or dataset errors, and `1` for an unexpected runtime failure.
 
 MLTool currently includes Phase 1 validation, Phase 2 preparation, Phase 3
 feature materialization, and Phase 4 isolated candidate training/leaderboards.
-Phase 5 adds HPO on the top candidates and selection of one configuration. It
-does not yet perform final refit or test evaluation.
+Phase 5 adds HPO on the top candidates and selection of one configuration, and
+Phase 6 refits that configuration on train+validation and evaluates it once on
+the test split.
