@@ -8,9 +8,11 @@ version = "0.1.0"
 description = "A small CLI for validating tabular machine-learning projects"
 requires-python = ">=3.12"
 dependencies = [
+    "cloudpickle>=3,<4",
     "pandas>=2.2,<3.0",
     "pyarrow>=15,<22",
     "PyYAML>=6,<7",
+    "scikit-learn>=1.5,<2",
 ]
 
 [project.optional-dependencies]
@@ -25,4 +27,3 @@ where = ["src"]
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
-

@@ -1,8 +1,9 @@
-"""Load and validate the intentionally small Phase-1 configuration schema."""
+"""Load and validate the intentionally small Phase-1/2 configuration schema."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import json
 from pathlib import Path
 from typing import Any
 
@@ -42,12 +43,34 @@ class ValidationConfig:
 
 
 @dataclass(frozen=True)
+class SplitConfig:
+    validation_ratio: float = 0.15
+    test_ratio: float = 0.15
+    stratify: str | bool = "auto"
+    random_seed: int = 42
+
+
+@dataclass(frozen=True)
+class ExternalPreprocessingConfig:
+    enabled: bool = False
+    entrypoint: str | None = None
+    params: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PreprocessingConfig:
+    external: ExternalPreprocessingConfig
+
+
+@dataclass(frozen=True)
 class MLToolConfig:
     schema_version: str
     project: ProjectConfig
     task: TaskConfig
     data: DataConfig
     validation: ValidationConfig
+    split: SplitConfig
+    preprocessing: PreprocessingConfig
     config_path: Path
 
 
@@ -70,6 +93,16 @@ def _boolean(parent: dict[str, Any], key: str, default: bool, qualified_name: st
     if not isinstance(value, bool):
         raise ConfigError(f'"{qualified_name}" must be true or false')
     return value
+
+
+def _ratio(parent: dict[str, Any], key: str, default: float) -> float:
+    value = parent.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f'"split.{key}" must be a number between 0 and 1')
+    result = float(value)
+    if not 0 < result < 1:
+        raise ConfigError(f'"split.{key}" must be greater than 0 and less than 1')
+    return result
 
 
 def load_config(path: Path | str = Path("mltool.yaml")) -> MLToolConfig:
@@ -128,6 +161,65 @@ def load_config(path: Path | str = Path("mltool.yaml")) -> MLToolConfig:
         ),
     )
 
+    split_raw = raw.get("split", {})
+    if not isinstance(split_raw, dict):
+        raise ConfigError('configuration section "split" must be a mapping')
+    validation_ratio = _ratio(split_raw, "validation_ratio", 0.15)
+    test_ratio = _ratio(split_raw, "test_ratio", 0.15)
+    if validation_ratio + test_ratio >= 1:
+        raise ConfigError(
+            '"split.validation_ratio" plus "split.test_ratio" must be less than 1'
+        )
+    stratify = split_raw.get("stratify", "auto")
+    if not isinstance(stratify, bool) and stratify != "auto":
+        raise ConfigError('"split.stratify" must be one of: auto, true, false')
+    random_seed = split_raw.get("random_seed", 42)
+    if isinstance(random_seed, bool) or not isinstance(random_seed, int):
+        raise ConfigError('"split.random_seed" must be an integer')
+    split = SplitConfig(
+        validation_ratio=validation_ratio,
+        test_ratio=test_ratio,
+        stratify=stratify,
+        random_seed=random_seed,
+    )
+
+    preprocessing_raw = raw.get("preprocessing", {})
+    if not isinstance(preprocessing_raw, dict):
+        raise ConfigError('configuration section "preprocessing" must be a mapping')
+    external_raw = preprocessing_raw.get("external", {})
+    if not isinstance(external_raw, dict):
+        raise ConfigError('"preprocessing.external" must be a mapping')
+    external_enabled = _boolean(
+        external_raw, "enabled", False, "preprocessing.external.enabled"
+    )
+    entrypoint = external_raw.get("entrypoint")
+    if entrypoint is not None and (
+        not isinstance(entrypoint, str) or not entrypoint.strip()
+    ):
+        raise ConfigError(
+            '"preprocessing.external.entrypoint" must be null or a non-empty string'
+        )
+    if external_enabled and entrypoint is None:
+        raise ConfigError(
+            '"preprocessing.external.entrypoint" is required when external preprocessing is enabled'
+        )
+    params = external_raw.get("params", {})
+    if not isinstance(params, dict) or not all(isinstance(key, str) for key in params):
+        raise ConfigError('"preprocessing.external.params" must be a mapping with string keys')
+    try:
+        json.dumps(params)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            '"preprocessing.external.params" values must be JSON-serializable'
+        ) from exc
+    preprocessing = PreprocessingConfig(
+        external=ExternalPreprocessingConfig(
+            enabled=external_enabled,
+            entrypoint=entrypoint.strip() if isinstance(entrypoint, str) else None,
+            params=dict(params),
+        )
+    )
+
     return MLToolConfig(
         schema_version=schema_version,
         project=ProjectConfig(name=project_name),
@@ -138,6 +230,7 @@ def load_config(path: Path | str = Path("mltool.yaml")) -> MLToolConfig:
         ),
         data=DataConfig(path=data_path, format=data_format),
         validation=validation,
+        split=split,
+        preprocessing=preprocessing,
         config_path=config_path,
     )
-

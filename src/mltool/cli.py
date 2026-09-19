@@ -1,4 +1,4 @@
-"""Command-line entry points for MLTool Phase 1."""
+"""Command-line entry points for MLTool Phases 1 and 2."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from pathlib import Path
 
 from mltool.config import ConfigError, MLToolConfig, load_config
 from mltool.data import DataLoadError, load_dataset
+from mltool.preparation import PreparationError, prepare_dataset, render_preparation_error
 from mltool.report import DatasetSummary, ValidationReport
 from mltool.validation import validate_dataset
 
@@ -30,16 +31,29 @@ data:
 validation:
   enabled: true
   fail_on_error: true
+
+split:
+  validation_ratio: 0.15
+  test_ratio: 0.15
+  stratify: auto
+  random_seed: 42
+
+preprocessing:
+  external:
+    enabled: false
+    entrypoint: null
+    params: {{}}
 '''
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="mltool", description="Validate a tabular MLTool project"
+        prog="mltool", description="Validate and prepare a tabular MLTool project"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("init", help="create a minimal MLTool project")
     subparsers.add_parser("validate", help="validate the configured dataset")
+    subparsers.add_parser("prepare", help="validate, split, and prepare the dataset")
     return parser
 
 
@@ -104,12 +118,48 @@ def validate_project(config_path: Path = Path("mltool.yaml")) -> int:
     return 0 if report.is_valid else 2
 
 
+def prepare_project(config_path: Path = Path("mltool.yaml")) -> int:
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        print(render_preparation_error(str(exc)))
+        return 2
+
+    try:
+        dataset = load_dataset(config.data)
+    except DataLoadError as exc:
+        print(render_preparation_error(str(exc)))
+        return 2
+
+    # Preparation always validates, even if validation.enabled is false. An
+    # invalid dataset must never reach splitting or external preprocessing.
+    validation_report = validate_dataset(config, dataset)
+    if not validation_report.is_valid:
+        print(validation_report.render())
+        return 2
+
+    try:
+        result = prepare_dataset(
+            config,
+            dataset,
+            warning_messages=validation_report.warnings,
+        )
+    except PreparationError as exc:
+        print(render_preparation_error(str(exc)))
+        return 2
+
+    print(result.render())
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "init":
             return init_project()
-        return validate_project()
+        if args.command == "validate":
+            return validate_project()
+        return prepare_project()
     except Exception as exc:  # Keep unexpected failures concise for CLI users.
         print(f"MLTool failed unexpectedly: {exc}", file=sys.stderr)
         return 1
