@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mltool"
+version = "0.1.0"
+description = "A small CLI for validating tabular machine-learning projects"
+requires-python = ">=3.12"
+dependencies = [
+    "pandas>=2.2,<3.0",
+    "pyarrow>=15,<22",
+    "PyYAML>=6,<7",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
+[project.scripts]
+mltool = "mltool.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
