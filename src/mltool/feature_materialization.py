@@ -408,7 +408,14 @@ def materialize_feature_sets(config: MLToolConfig) -> FeatureMaterializationResu
                 "manifest": str(prepared.manifest_path),
             },
             "source_dataset_fingerprint": prepared.source_fingerprint,
+            "task": {
+                "type": config.task.type,
+                "target": config.task.target,
+            },
             "target": config.task.target,
+            "prepared_feature_columns": [
+                column for column in prepared.train.columns if column != config.task.target
+            ],
             "rows": {
                 "train": len(prepared.train),
                 "validation": len(prepared.validation),

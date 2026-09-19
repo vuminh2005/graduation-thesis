@@ -1,9 +1,8 @@
 # MLTool
 
-MLTool validates and prepares tabular supervised-ML projects. It loads a small
-YAML configuration, reads CSV or Parquet data, computes a SHA-256 file
-fingerprint, reports validation diagnostics, and materializes deterministic
-train/validation/test Parquet splits and reproducible feature sets.
+MLTool validates and prepares tabular supervised-ML projects, materializes
+reproducible feature sets, and compares isolated AutoGluon model families on a
+shared validation split. It keeps the test split untouched for a later phase.
 
 ## Install for development
 
@@ -21,6 +20,9 @@ mkdir demo && cd demo
 /path/to/graduation-thesis/.venv/bin/mltool validate
 /path/to/graduation-thesis/.venv/bin/mltool prepare
 /path/to/graduation-thesis/.venv/bin/mltool features
+/path/to/graduation-thesis/.venv/bin/mltool plan
+/path/to/graduation-thesis/.venv/bin/mltool train
+/path/to/graduation-thesis/.venv/bin/mltool leaderboard
 ```
 
 Run `mltool validate` from the directory containing `mltool.yaml`; Phase 1 does
@@ -54,6 +56,19 @@ chained: plugin order controls only generated-column concatenation order.
 FeatureSet artifacts and lineage manifests are written atomically under
 `.mltool/features/`.
 
+`plan` validates that the materialized FeatureSets still match the current
+dataset and feature configuration, then prints the deterministic FeatureSet ×
+model Cartesian product without creating training output. `train` executes
+those candidates sequentially with AutoGluon Tabular on CPU. Every candidate
+receives only its FeatureSet train split during `fit`; MLTool predicts and
+computes configured metrics on the common validation split afterward. HPO,
+bagging, stacking, and AutoGluon's weighted ensemble are disabled so each
+candidate represents exactly one configured family.
+
+Training artifacts live under `.mltool/training/`, including one predictor and
+result per candidate plus JSON/CSV global leaderboards. `leaderboard` is
+read-only. Phase 4 never loads or evaluates FeatureSet `test.parquet` files.
+
 Changing the raw dataset invalidates prepared input and requires another
 `mltool prepare`. Phase 2 does not currently fingerprint external preprocessor
 source code, so changing that code also requires the user to rerun preparation.
@@ -61,5 +76,7 @@ source code, so changing that code also requires the user to rerun preparation.
 The validation command exits with `0` for a valid project, `2` for expected
 configuration or dataset errors, and `1` for an unexpected runtime failure.
 
-MLTool currently includes Phase 1 validation, Phase 2 preparation, and Phase 3
-feature-set materialization only.
+MLTool currently includes Phase 1 validation, Phase 2 preparation, Phase 3
+feature materialization, and Phase 4 isolated candidate training/leaderboards.
+It does not yet perform HPO, formal model selection, final refit, or test
+evaluation.

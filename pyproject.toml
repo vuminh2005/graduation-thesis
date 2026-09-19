@@ -5,12 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mltool"
 version = "0.1.0"
-description = "A small CLI for validating and preparing tabular ML experiments"
+description = "A CLI for preparing and comparing tabular ML experiments"
 requires-python = ">=3.12"
 dependencies = [
+    "autogluon.tabular[lightgbm,catboost,xgboost]>=1.6,<1.7",
     "cloudpickle>=3,<4",
     "pandas>=2.2,<3.0",
-    "pyarrow>=15,<22",
+    "pyarrow>=23,<25",
     "PyYAML>=6,<7",
     "scikit-learn>=1.5,<2",
 ]

@@ -646,6 +646,9 @@ def test_init_template_contains_only_supported_phase_sections(tmp_path: Path) ->
         "split",
         "preprocessing",
         "features",
+        "models",
+        "evaluation",
+        "training",
     }
     assert raw["split"] == {
         "validation_ratio": 0.15,
@@ -660,3 +663,12 @@ def test_init_template_contains_only_supported_phase_sections(tmp_path: Path) ->
         "plugins": [],
         "sets": [{"name": "base", "source_columns": ["*"], "plugins": []}],
     }
+    assert raw["models"] == [
+        {"name": "lightgbm", "family": "GBM", "params": {}},
+        {"name": "random_forest", "family": "RF", "params": {}},
+    ]
+    assert raw["evaluation"] == {
+        "primary_metric": "roc_auc",
+        "secondary_metrics": ["f1", "accuracy"],
+    }
+    assert raw["training"] == {"time_limit_seconds": None}

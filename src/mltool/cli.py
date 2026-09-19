@@ -1,4 +1,4 @@
-"""Command-line entry points for MLTool Phases 1 through 3."""
+"""Command-line entry points for MLTool Phases 1 through 4."""
 
 from __future__ import annotations
 
@@ -14,8 +14,14 @@ from mltool.feature_materialization import (
     materialize_feature_sets,
     render_feature_error,
 )
+from mltool.experiment import (
+    ExperimentError,
+    build_experiment_plan,
+    render_experiment_error,
+)
 from mltool.preparation import PreparationError, prepare_dataset, render_preparation_error
 from mltool.report import DatasetSummary, ValidationReport
+from mltool.training import TrainingError, load_persisted_leaderboard, train_experiment
 from mltool.validation import validate_dataset
 
 
@@ -57,19 +63,40 @@ features:
       source_columns:
         - "*"
       plugins: []
+
+models:
+  - name: lightgbm
+    family: GBM
+    params: {{}}
+
+  - name: random_forest
+    family: RF
+    params: {{}}
+
+evaluation:
+  primary_metric: roc_auc
+  secondary_metrics:
+    - f1
+    - accuracy
+
+training:
+  time_limit_seconds: null
 '''
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mltool",
-        description="Validate, prepare, and materialize features for an MLTool project",
+        description="Prepare feature experiments and train isolated AutoGluon candidates",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("init", help="create a minimal MLTool project")
     subparsers.add_parser("validate", help="validate the configured dataset")
     subparsers.add_parser("prepare", help="validate, split, and prepare the dataset")
     subparsers.add_parser("features", help="materialize configured feature sets")
+    subparsers.add_parser("plan", help="show the FeatureSet x model candidate matrix")
+    subparsers.add_parser("train", help="train and evaluate configured candidates")
+    subparsers.add_parser("leaderboard", help="show the persisted global leaderboard")
     return parser
 
 
@@ -185,6 +212,40 @@ def features_project(config_path: Path = Path("mltool.yaml")) -> int:
     return 0
 
 
+def plan_project(config_path: Path = Path("mltool.yaml")) -> int:
+    try:
+        config = load_config(config_path)
+        plan = build_experiment_plan(config)
+    except (ConfigError, ExperimentError) as exc:
+        print(render_experiment_error("MLTool training plan", str(exc)))
+        return 2
+    print(plan.render())
+    return 0
+
+
+def train_project(config_path: Path = Path("mltool.yaml")) -> int:
+    try:
+        config = load_config(config_path)
+        plan = build_experiment_plan(config)
+        result = train_experiment(plan)
+    except (ConfigError, ExperimentError, TrainingError) as exc:
+        print(render_experiment_error("MLTool candidate training", str(exc)))
+        return 2
+    print(result.render())
+    return 0 if result.is_successful else 1
+
+
+def leaderboard_project(config_path: Path = Path("mltool.yaml")) -> int:
+    try:
+        config = load_config(config_path)
+        leaderboard = load_persisted_leaderboard(config)
+    except (ConfigError, TrainingError) as exc:
+        print(render_experiment_error("MLTool global leaderboard", str(exc)))
+        return 2
+    print(leaderboard.render())
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -194,7 +255,13 @@ def main(argv: list[str] | None = None) -> int:
             return validate_project()
         if args.command == "prepare":
             return prepare_project()
-        return features_project()
+        if args.command == "features":
+            return features_project()
+        if args.command == "plan":
+            return plan_project()
+        if args.command == "train":
+            return train_project()
+        return leaderboard_project()
     except Exception as exc:  # Keep unexpected failures concise for CLI users.
         print(f"MLTool failed unexpectedly: {exc}", file=sys.stderr)
         return 1

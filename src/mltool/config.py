@@ -1,4 +1,4 @@
-"""Load and validate the intentionally small Phase-1/2/3 configuration schema."""
+"""Load and validate the intentionally small Phase-1 through Phase-4 schema."""
 
 from __future__ import annotations
 
@@ -13,7 +13,29 @@ import yaml
 
 SUPPORTED_TASKS = {"binary", "multiclass", "regression"}
 SUPPORTED_FORMATS = {"auto", "csv", "parquet"}
-SAFE_FEATURE_SET_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+SUPPORTED_MODEL_FAMILIES = {"GBM", "CAT", "XGB", "RF", "XT"}
+SUPPORTED_METRICS = {
+    "binary": {"roc_auc", "f1", "accuracy", "log_loss"},
+    "multiclass": {"accuracy", "f1_macro", "log_loss"},
+    "regression": {"rmse", "mae", "r2"},
+}
+DEFAULT_METRICS = {
+    "binary": ("roc_auc", ["f1", "accuracy"]),
+    "multiclass": ("accuracy", ["f1_macro"]),
+    "regression": ("rmse", ["mae", "r2"]),
+}
+METRIC_DIRECTIONS = {
+    "roc_auc": "maximize",
+    "f1": "maximize",
+    "accuracy": "maximize",
+    "f1_macro": "maximize",
+    "r2": "maximize",
+    "log_loss": "minimize",
+    "rmse": "minimize",
+    "mae": "minimize",
+}
+SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+SAFE_FEATURE_SET_NAME = SAFE_IDENTIFIER
 
 
 class ConfigError(ValueError):
@@ -85,6 +107,32 @@ class FeaturesConfig:
 
 
 @dataclass(frozen=True)
+class ModelConfig:
+    name: str
+    family: str
+    params: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class EvaluationConfig:
+    primary_metric: str
+    secondary_metrics: list[str]
+
+    @property
+    def metrics(self) -> list[str]:
+        return [self.primary_metric, *self.secondary_metrics]
+
+    @property
+    def direction(self) -> str:
+        return METRIC_DIRECTIONS[self.primary_metric]
+
+
+@dataclass(frozen=True)
+class TrainingConfig:
+    time_limit_seconds: int | None = None
+
+
+@dataclass(frozen=True)
 class MLToolConfig:
     schema_version: str
     project: ProjectConfig
@@ -94,6 +142,9 @@ class MLToolConfig:
     split: SplitConfig
     preprocessing: PreprocessingConfig
     features: FeaturesConfig
+    models: list[ModelConfig]
+    evaluation: EvaluationConfig
+    training: TrainingConfig
     config_path: Path
 
 
@@ -126,6 +177,91 @@ def _ratio(parent: dict[str, Any], key: str, default: float) -> float:
     if not 0 < result < 1:
         raise ConfigError(f'"split.{key}" must be greater than 0 and less than 1')
     return result
+
+
+def _json_mapping(value: Any, qualified_name: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        raise ConfigError(f'"{qualified_name}" must be a mapping with string keys')
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f'"{qualified_name}" values must be JSON-serializable') from exc
+    return dict(value)
+
+
+def _model_config(raw: dict[str, Any]) -> list[ModelConfig]:
+    models_raw = raw.get("models", [])
+    if not isinstance(models_raw, list):
+        raise ConfigError('"models" must be a list')
+    models: list[ModelConfig] = []
+    names: set[str] = set()
+    for index, model_raw in enumerate(models_raw):
+        prefix = f"models[{index}]"
+        if not isinstance(model_raw, dict):
+            raise ConfigError(f'"{prefix}" must be a mapping')
+        name = _non_empty_string(model_raw, "name", f"{prefix}.name")
+        if not SAFE_IDENTIFIER.fullmatch(name):
+            raise ConfigError(
+                f'model name "{name}" is unsafe; use only letters, numbers, underscore, and hyphen'
+            )
+        if name in names:
+            raise ConfigError(f'duplicate model name "{name}"')
+        names.add(name)
+        family = _non_empty_string(model_raw, "family", f"{prefix}.family")
+        if family not in SUPPORTED_MODEL_FAMILIES:
+            supported = ", ".join(sorted(SUPPORTED_MODEL_FAMILIES))
+            raise ConfigError(
+                f'unsupported model family "{family}"; expected one of: {supported}'
+            )
+        params = _json_mapping(model_raw.get("params", {}), f"{prefix}.params")
+        models.append(ModelConfig(name=name, family=family, params=params))
+    return models
+
+
+def _evaluation_config(raw: dict[str, Any], task_type: str) -> EvaluationConfig:
+    default_primary, default_secondary = DEFAULT_METRICS[task_type]
+    evaluation_raw = raw.get("evaluation", {})
+    if not isinstance(evaluation_raw, dict):
+        raise ConfigError('configuration section "evaluation" must be a mapping')
+    primary = evaluation_raw.get("primary_metric", default_primary)
+    if not isinstance(primary, str) or not primary.strip():
+        raise ConfigError('"evaluation.primary_metric" must be a non-empty string')
+    primary = primary.strip()
+    secondary = evaluation_raw.get("secondary_metrics", default_secondary)
+    if not isinstance(secondary, list) or not all(
+        isinstance(metric, str) and metric.strip() for metric in secondary
+    ):
+        raise ConfigError(
+            '"evaluation.secondary_metrics" must be a list of non-empty strings'
+        )
+    secondary = [metric.strip() for metric in secondary]
+    if len(secondary) != len(set(secondary)):
+        raise ConfigError('"evaluation.secondary_metrics" must contain unique values')
+    if primary in secondary:
+        raise ConfigError(
+            '"evaluation.secondary_metrics" must not repeat the primary metric'
+        )
+    allowed = SUPPORTED_METRICS[task_type]
+    for metric in [primary, *secondary]:
+        if metric not in allowed:
+            supported = ", ".join(sorted(allowed))
+            raise ConfigError(
+                f'metric "{metric}" is not supported for task "{task_type}"; '
+                f"expected one of: {supported}"
+            )
+    return EvaluationConfig(primary_metric=primary, secondary_metrics=secondary)
+
+
+def _training_config(raw: dict[str, Any]) -> TrainingConfig:
+    training_raw = raw.get("training", {})
+    if not isinstance(training_raw, dict):
+        raise ConfigError('configuration section "training" must be a mapping')
+    time_limit = training_raw.get("time_limit_seconds")
+    if time_limit is not None and (
+        isinstance(time_limit, bool) or not isinstance(time_limit, int) or time_limit <= 0
+    ):
+        raise ConfigError('"training.time_limit_seconds" must be null or a positive integer')
+    return TrainingConfig(time_limit_seconds=time_limit)
 
 
 def _feature_config(raw: dict[str, Any]) -> FeaturesConfig:
@@ -343,6 +479,9 @@ def load_config(path: Path | str = Path("mltool.yaml")) -> MLToolConfig:
         )
     )
     features = _feature_config(raw)
+    models = _model_config(raw)
+    evaluation = _evaluation_config(raw, task_type)
+    training = _training_config(raw)
 
     return MLToolConfig(
         schema_version=schema_version,
@@ -357,5 +496,8 @@ def load_config(path: Path | str = Path("mltool.yaml")) -> MLToolConfig:
         split=split,
         preprocessing=preprocessing,
         features=features,
+        models=models,
+        evaluation=evaluation,
+        training=training,
         config_path=config_path,
     )
