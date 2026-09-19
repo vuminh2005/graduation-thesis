@@ -1,4 +1,4 @@
-"""Load and validate the intentionally small Phase-1 through Phase-4 schema."""
+"""Load and validate the intentionally small Phase-1 through Phase-5 schema."""
 
 from __future__ import annotations
 
@@ -130,6 +130,14 @@ class EvaluationConfig:
 @dataclass(frozen=True)
 class TrainingConfig:
     time_limit_seconds: int | None = None
+    seed: int | None = None
+
+
+@dataclass(frozen=True)
+class HpoConfig:
+    top_n: int
+    num_trials: int
+    time_limit_seconds: int
 
 
 @dataclass(frozen=True)
@@ -146,6 +154,7 @@ class MLToolConfig:
     evaluation: EvaluationConfig
     training: TrainingConfig
     config_path: Path
+    hpo: HpoConfig | None = None
 
 
 def _mapping(parent: dict[str, Any], key: str) -> dict[str, Any]:
@@ -261,7 +270,37 @@ def _training_config(raw: dict[str, Any]) -> TrainingConfig:
         isinstance(time_limit, bool) or not isinstance(time_limit, int) or time_limit <= 0
     ):
         raise ConfigError('"training.time_limit_seconds" must be null or a positive integer')
-    return TrainingConfig(time_limit_seconds=time_limit)
+    seed = training_raw.get("seed")
+    if seed is not None and (
+        isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**31
+    ):
+        raise ConfigError('"training.seed" must be null or an integer in [0, 2**31)')
+    return TrainingConfig(time_limit_seconds=time_limit, seed=seed)
+
+
+def _positive_int(parent: dict[str, Any], key: str, default: int | None) -> int:
+    value = parent.get(key, default)
+    if value is None:
+        raise ConfigError(f'"hpo.{key}" is required')
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ConfigError(f'"hpo.{key}" must be a positive integer')
+    return value
+
+
+def _hpo_config(raw: dict[str, Any]) -> HpoConfig | None:
+    if "hpo" not in raw or raw["hpo"] is None:
+        return None
+    hpo_raw = raw["hpo"]
+    if not isinstance(hpo_raw, dict):
+        raise ConfigError('configuration section "hpo" must be a mapping')
+    unknown = sorted(set(hpo_raw) - {"top_n", "num_trials", "time_limit_seconds"})
+    if unknown:
+        raise ConfigError(f'unsupported "hpo" setting(s): {", ".join(map(str, unknown))}')
+    return HpoConfig(
+        top_n=_positive_int(hpo_raw, "top_n", 3),
+        num_trials=_positive_int(hpo_raw, "num_trials", 10),
+        time_limit_seconds=_positive_int(hpo_raw, "time_limit_seconds", None),
+    )
 
 
 def _feature_config(raw: dict[str, Any]) -> FeaturesConfig:
@@ -482,6 +521,7 @@ def load_config(path: Path | str = Path("mltool.yaml")) -> MLToolConfig:
     models = _model_config(raw)
     evaluation = _evaluation_config(raw, task_type)
     training = _training_config(raw)
+    hpo = _hpo_config(raw)
 
     return MLToolConfig(
         schema_version=schema_version,
@@ -500,4 +540,5 @@ def load_config(path: Path | str = Path("mltool.yaml")) -> MLToolConfig:
         evaluation=evaluation,
         training=training,
         config_path=config_path,
+        hpo=hpo,
     )

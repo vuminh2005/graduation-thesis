@@ -23,6 +23,8 @@ mkdir demo && cd demo
 /path/to/graduation-thesis/.venv/bin/mltool plan
 /path/to/graduation-thesis/.venv/bin/mltool train
 /path/to/graduation-thesis/.venv/bin/mltool leaderboard
+/path/to/graduation-thesis/.venv/bin/mltool tune
+/path/to/graduation-thesis/.venv/bin/mltool tuning-leaderboard
 ```
 
 Run `mltool validate` from the directory containing `mltool.yaml`; Phase 1 does
@@ -69,6 +71,41 @@ Training artifacts live under `.mltool/training/`, including one predictor and
 result per candidate plus JSON/CSV global leaderboards. `leaderboard` is
 read-only. Phase 4 never loads or evaluates FeatureSet `test.parquet` files.
 
+`tune` (Phase 5) needs an optional `hpo:` section, which `init` does not write:
+
+```yaml
+hpo:
+  top_n: 3               # best Phase-4 SUCCEEDED candidates to tune (default 3)
+  num_trials: 10         # HPO trials per candidate (default 10)
+  time_limit_seconds: 600  # required; hard budget per candidate
+```
+
+It refuses to run on stale training artifacts, re-fits each selected candidate
+on its FeatureSet train split with a local, sequential random search
+(`num_trials`, `time_limit_seconds`), and evaluates on the validation split only.
+Bagging, stacking, weighted ensembles, GPUs, and test data stay off. Params you
+fix in a model's `params` stay fixed; the rest of AutoGluon's default search
+space is tuned. Families without a default AutoGluon search space (RF, XT) train once with
+default hyperparameters; `tune` warns about each such candidate and marks it
+`hpo_effective: false` in `result.json` and `selected.json`.
+
+Two different holdouts are involved. Inside each candidate, AutoGluon picks the
+winning trial on its own internal holdout carved from the train split.
+Cross-candidate ranking (`top_n` selection and the tuning leaderboard) uses
+MLTool's validation split. A tuned score can therefore come out lower than the
+same candidate's untuned Phase 4 score, and `selected.json` is the best tuned
+configuration, not a guarantee of improvement over Phase 4.
+
+Set `training.seed` (default `null`) to control randomness in both `train` and
+`tune`. AutoGluon 1.6 has no seed argument on `fit`, so MLTool passes it as the
+learner's `random_state` (internal holdout split) and as the model's own seed
+hyperparameter (`seed`, `random_state` or `random_seed` depending on family);
+a seed you fix in a model's `params` wins. When unset, AutoGluon's own default
+seed of 0 applies.
+Output goes to `.mltool/tuning/` (`candidates/`, `leaderboard.json/csv`,
+`manifest.json`, and `selected.json`, the best tuned configuration for a later
+final refit). `tuning-leaderboard` is read-only.
+
 Changing the raw dataset invalidates prepared input and requires another
 `mltool prepare`. Phase 2 does not currently fingerprint external preprocessor
 source code, so changing that code also requires the user to rerun preparation.
@@ -78,5 +115,5 @@ configuration or dataset errors, and `1` for an unexpected runtime failure.
 
 MLTool currently includes Phase 1 validation, Phase 2 preparation, Phase 3
 feature materialization, and Phase 4 isolated candidate training/leaderboards.
-It does not yet perform HPO, formal model selection, final refit, or test
-evaluation.
+Phase 5 adds HPO on the top candidates and selection of one configuration. It
+does not yet perform final refit or test evaluation.

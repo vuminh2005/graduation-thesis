@@ -1,4 +1,4 @@
-"""Command-line entry points for MLTool Phases 1 through 4."""
+"""Command-line entry points for MLTool Phases 1 through 5."""
 
 from __future__ import annotations
 
@@ -22,6 +22,12 @@ from mltool.experiment import (
 from mltool.preparation import PreparationError, prepare_dataset, render_preparation_error
 from mltool.report import DatasetSummary, ValidationReport
 from mltool.training import TrainingError, load_persisted_leaderboard, train_experiment
+from mltool.tuning import (
+    TuningError,
+    build_tuning_selection,
+    load_persisted_tuning,
+    tune_experiment,
+)
 from mltool.validation import validate_dataset
 
 
@@ -97,6 +103,8 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser("plan", help="show the FeatureSet x model candidate matrix")
     subparsers.add_parser("train", help="train and evaluate configured candidates")
     subparsers.add_parser("leaderboard", help="show the persisted global leaderboard")
+    subparsers.add_parser("tune", help="run HPO on the top training candidates and select one")
+    subparsers.add_parser("tuning-leaderboard", help="show the persisted tuning leaderboard")
     return parser
 
 
@@ -246,6 +254,30 @@ def leaderboard_project(config_path: Path = Path("mltool.yaml")) -> int:
     return 0
 
 
+def tune_project(config_path: Path = Path("mltool.yaml")) -> int:
+    try:
+        config = load_config(config_path)
+        plan = build_experiment_plan(config)
+        selection = build_tuning_selection(plan)
+        result = tune_experiment(plan, selection)
+    except (ConfigError, ExperimentError, TrainingError, TuningError) as exc:
+        print(render_experiment_error("MLTool hyperparameter tuning", str(exc)))
+        return 2
+    print(result.render())
+    return 0 if result.is_successful else 1
+
+
+def tuning_leaderboard_project(config_path: Path = Path("mltool.yaml")) -> int:
+    try:
+        config = load_config(config_path)
+        tuning = load_persisted_tuning(config)
+    except (ConfigError, TuningError) as exc:
+        print(render_experiment_error("MLTool tuning leaderboard", str(exc)))
+        return 2
+    print(tuning.render())
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -261,7 +293,11 @@ def main(argv: list[str] | None = None) -> int:
             return plan_project()
         if args.command == "train":
             return train_project()
-        return leaderboard_project()
+        if args.command == "leaderboard":
+            return leaderboard_project()
+        if args.command == "tune":
+            return tune_project()
+        return tuning_leaderboard_project()
     except Exception as exc:  # Keep unexpected failures concise for CLI users.
         print(f"MLTool failed unexpectedly: {exc}", file=sys.stderr)
         return 1
