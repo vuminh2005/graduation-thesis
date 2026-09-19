@@ -1,3 +1,3 @@
-"""MLTool: tabular dataset validation and Phase-2 preparation."""
+"""MLTool: tabular validation, preparation, and feature materialization."""
 
 __version__ = "0.1.0"

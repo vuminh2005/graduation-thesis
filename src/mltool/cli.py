@@ -1,4 +1,4 @@
-"""Command-line entry points for MLTool Phases 1 and 2."""
+"""Command-line entry points for MLTool Phases 1 through 3."""
 
 from __future__ import annotations
 
@@ -9,6 +9,11 @@ from pathlib import Path
 
 from mltool.config import ConfigError, MLToolConfig, load_config
 from mltool.data import DataLoadError, load_dataset
+from mltool.feature_materialization import (
+    FeatureMaterializationError,
+    materialize_feature_sets,
+    render_feature_error,
+)
 from mltool.preparation import PreparationError, prepare_dataset, render_preparation_error
 from mltool.report import DatasetSummary, ValidationReport
 from mltool.validation import validate_dataset
@@ -43,17 +48,28 @@ preprocessing:
     enabled: false
     entrypoint: null
     params: {{}}
+
+features:
+  plugins: []
+
+  sets:
+    - name: base
+      source_columns:
+        - "*"
+      plugins: []
 '''
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="mltool", description="Validate and prepare a tabular MLTool project"
+        prog="mltool",
+        description="Validate, prepare, and materialize features for an MLTool project",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("init", help="create a minimal MLTool project")
     subparsers.add_parser("validate", help="validate the configured dataset")
     subparsers.add_parser("prepare", help="validate, split, and prepare the dataset")
+    subparsers.add_parser("features", help="materialize configured feature sets")
     return parser
 
 
@@ -152,6 +168,23 @@ def prepare_project(config_path: Path = Path("mltool.yaml")) -> int:
     return 0
 
 
+def features_project(config_path: Path = Path("mltool.yaml")) -> int:
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        print(render_feature_error(str(exc)))
+        return 2
+
+    try:
+        result = materialize_feature_sets(config)
+    except FeatureMaterializationError as exc:
+        print(render_feature_error(str(exc)))
+        return 2
+
+    print(result.render())
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -159,7 +192,9 @@ def main(argv: list[str] | None = None) -> int:
             return init_project()
         if args.command == "validate":
             return validate_project()
-        return prepare_project()
+        if args.command == "prepare":
+            return prepare_project()
+        return features_project()
     except Exception as exc:  # Keep unexpected failures concise for CLI users.
         print(f"MLTool failed unexpectedly: {exc}", file=sys.stderr)
         return 1

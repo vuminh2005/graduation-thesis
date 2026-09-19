@@ -3,7 +3,7 @@
 MLTool validates and prepares tabular supervised-ML projects. It loads a small
 YAML configuration, reads CSV or Parquet data, computes a SHA-256 file
 fingerprint, reports validation diagnostics, and materializes deterministic
-train/validation/test Parquet splits.
+train/validation/test Parquet splits and reproducible feature sets.
 
 ## Install for development
 
@@ -20,6 +20,7 @@ mkdir demo && cd demo
 # Put the configured CSV or Parquet file in place and edit mltool.yaml as needed.
 /path/to/graduation-thesis/.venv/bin/mltool validate
 /path/to/graduation-thesis/.venv/bin/mltool prepare
+/path/to/graduation-thesis/.venv/bin/mltool features
 ```
 
 Run `mltool validate` from the directory containing `mltool.yaml`; Phase 1 does
@@ -45,7 +46,20 @@ contain numeric-looking strings remain unchanged during preparation. TODO for
 the later training phase: decide whether its model integration requires an
 explicit numeric target representation.
 
+`features` reads `.mltool/prepared/` without splitting or preprocessing again.
+Each configured feature plugin is instantiated separately per FeatureSet,
+fitted on that set's train base features only, and independently transforms the
+same base columns for train, validation, and test. Plugin outputs are never
+chained: plugin order controls only generated-column concatenation order.
+FeatureSet artifacts and lineage manifests are written atomically under
+`.mltool/features/`.
+
+Changing the raw dataset invalidates prepared input and requires another
+`mltool prepare`. Phase 2 does not currently fingerprint external preprocessor
+source code, so changing that code also requires the user to rerun preparation.
+
 The validation command exits with `0` for a valid project, `2` for expected
 configuration or dataset errors, and `1` for an unexpected runtime failure.
 
-MLTool currently includes Phase 1 validation and Phase 2 preparation only.
+MLTool currently includes Phase 1 validation, Phase 2 preparation, and Phase 3
+feature-set materialization only.

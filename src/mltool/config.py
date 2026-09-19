@@ -1,10 +1,11 @@
-"""Load and validate the intentionally small Phase-1/2 configuration schema."""
+"""Load and validate the intentionally small Phase-1/2/3 configuration schema."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 import yaml
@@ -12,6 +13,7 @@ import yaml
 
 SUPPORTED_TASKS = {"binary", "multiclass", "regression"}
 SUPPORTED_FORMATS = {"auto", "csv", "parquet"}
+SAFE_FEATURE_SET_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
 class ConfigError(ValueError):
@@ -63,6 +65,26 @@ class PreprocessingConfig:
 
 
 @dataclass(frozen=True)
+class FeaturePluginConfig:
+    name: str
+    entrypoint: str
+    params: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class FeatureSetConfig:
+    name: str
+    source_columns: list[str]
+    plugins: list[str]
+
+
+@dataclass(frozen=True)
+class FeaturesConfig:
+    plugins: list[FeaturePluginConfig]
+    sets: list[FeatureSetConfig]
+
+
+@dataclass(frozen=True)
 class MLToolConfig:
     schema_version: str
     project: ProjectConfig
@@ -71,6 +93,7 @@ class MLToolConfig:
     validation: ValidationConfig
     split: SplitConfig
     preprocessing: PreprocessingConfig
+    features: FeaturesConfig
     config_path: Path
 
 
@@ -103,6 +126,106 @@ def _ratio(parent: dict[str, Any], key: str, default: float) -> float:
     if not 0 < result < 1:
         raise ConfigError(f'"split.{key}" must be greater than 0 and less than 1')
     return result
+
+
+def _feature_config(raw: dict[str, Any]) -> FeaturesConfig:
+    features_raw = raw.get("features")
+    if features_raw is None:
+        return FeaturesConfig(
+            plugins=[],
+            sets=[FeatureSetConfig(name="base", source_columns=["*"], plugins=[])],
+        )
+    if not isinstance(features_raw, dict):
+        raise ConfigError('configuration section "features" must be a mapping')
+
+    plugins_raw = features_raw.get("plugins", [])
+    if not isinstance(plugins_raw, list):
+        raise ConfigError('"features.plugins" must be a list')
+    plugins: list[FeaturePluginConfig] = []
+    plugin_names: set[str] = set()
+    for index, plugin_raw in enumerate(plugins_raw):
+        prefix = f"features.plugins[{index}]"
+        if not isinstance(plugin_raw, dict):
+            raise ConfigError(f'"{prefix}" must be a mapping')
+        name = _non_empty_string(plugin_raw, "name", f"{prefix}.name")
+        if name in plugin_names:
+            raise ConfigError(f'duplicate feature plugin name "{name}"')
+        plugin_names.add(name)
+        entrypoint = _non_empty_string(
+            plugin_raw, "entrypoint", f"{prefix}.entrypoint"
+        )
+        params = plugin_raw.get("params", {})
+        if not isinstance(params, dict) or not all(
+            isinstance(key, str) for key in params
+        ):
+            raise ConfigError(f'"{prefix}.params" must be a mapping with string keys')
+        try:
+            json.dumps(params)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f'"{prefix}.params" values must be JSON-serializable') from exc
+        plugins.append(
+            FeaturePluginConfig(
+                name=name,
+                entrypoint=entrypoint,
+                params=dict(params),
+            )
+        )
+
+    sets_raw = features_raw.get("sets")
+    if not isinstance(sets_raw, list) or not sets_raw:
+        raise ConfigError('"features.sets" must be a non-empty list')
+    feature_sets: list[FeatureSetConfig] = []
+    set_names: set[str] = set()
+    for index, set_raw in enumerate(sets_raw):
+        prefix = f"features.sets[{index}]"
+        if not isinstance(set_raw, dict):
+            raise ConfigError(f'"{prefix}" must be a mapping')
+        name = _non_empty_string(set_raw, "name", f"{prefix}.name")
+        if not SAFE_FEATURE_SET_NAME.fullmatch(name):
+            raise ConfigError(
+                f'feature-set name "{name}" is unsafe; use only letters, numbers, underscore, and hyphen'
+            )
+        if name in set_names:
+            raise ConfigError(f'duplicate feature-set name "{name}"')
+        set_names.add(name)
+
+        source_columns = set_raw.get("source_columns")
+        if not isinstance(source_columns, list) or not source_columns:
+            raise ConfigError(f'"{prefix}.source_columns" must be a non-empty list')
+        if not all(isinstance(column, str) and column for column in source_columns):
+            raise ConfigError(
+                f'"{prefix}.source_columns" must contain non-empty strings'
+            )
+        if len(source_columns) != len(set(source_columns)):
+            raise ConfigError(f'"{prefix}.source_columns" must contain unique values')
+        if "*" in source_columns and source_columns != ["*"]:
+            raise ConfigError(f'"{prefix}.source_columns": "*" must appear alone')
+
+        referenced_plugins = set_raw.get("plugins", [])
+        if not isinstance(referenced_plugins, list) or not all(
+            isinstance(plugin_name, str) and plugin_name
+            for plugin_name in referenced_plugins
+        ):
+            raise ConfigError(f'"{prefix}.plugins" must be a list of non-empty strings')
+        if len(referenced_plugins) != len(set(referenced_plugins)):
+            raise ConfigError(f'"{prefix}.plugins" must contain unique plugin names')
+        unknown = [
+            plugin_name
+            for plugin_name in referenced_plugins
+            if plugin_name not in plugin_names
+        ]
+        if unknown:
+            raise ConfigError(
+                f'feature set "{name}" references unknown plugin "{unknown[0]}"'
+            )
+        feature_sets.append(
+            FeatureSetConfig(
+                name=name,
+                source_columns=list(source_columns),
+                plugins=list(referenced_plugins),
+            )
+        )
+    return FeaturesConfig(plugins=plugins, sets=feature_sets)
 
 
 def load_config(path: Path | str = Path("mltool.yaml")) -> MLToolConfig:
@@ -219,6 +342,7 @@ def load_config(path: Path | str = Path("mltool.yaml")) -> MLToolConfig:
             params=dict(params),
         )
     )
+    features = _feature_config(raw)
 
     return MLToolConfig(
         schema_version=schema_version,
@@ -232,5 +356,6 @@ def load_config(path: Path | str = Path("mltool.yaml")) -> MLToolConfig:
         validation=validation,
         split=split,
         preprocessing=preprocessing,
+        features=features,
         config_path=config_path,
     )

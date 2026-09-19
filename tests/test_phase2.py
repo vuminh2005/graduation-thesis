@@ -633,7 +633,7 @@ def test_prepare_validates_even_when_validation_is_configured_disabled(
     assert not (tmp_path / ".mltool").exists()
 
 
-def test_init_template_contains_only_phase1_and_phase2_sections(tmp_path: Path) -> None:
+def test_init_template_contains_only_supported_phase_sections(tmp_path: Path) -> None:
     assert init_project(tmp_path) == 0
 
     raw = yaml.safe_load((tmp_path / "mltool.yaml").read_text(encoding="utf-8"))
@@ -645,6 +645,7 @@ def test_init_template_contains_only_phase1_and_phase2_sections(tmp_path: Path) 
         "validation",
         "split",
         "preprocessing",
+        "features",
     }
     assert raw["split"] == {
         "validation_ratio": 0.15,
@@ -654,4 +655,8 @@ def test_init_template_contains_only_phase1_and_phase2_sections(tmp_path: Path) 
     }
     assert raw["preprocessing"] == {
         "external": {"enabled": False, "entrypoint": None, "params": {}}
+    }
+    assert raw["features"] == {
+        "plugins": [],
+        "sets": [{"name": "base", "source_columns": ["*"], "plugins": []}],
     }

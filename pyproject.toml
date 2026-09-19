@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mltool"
 version = "0.1.0"
-description = "A small CLI for validating tabular machine-learning projects"
+description = "A small CLI for validating and preparing tabular ML experiments"
 requires-python = ">=3.12"
 dependencies = [
     "cloudpickle>=3,<4",
