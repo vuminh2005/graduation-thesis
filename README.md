@@ -2,9 +2,15 @@
 
 MLTool validates and prepares tabular supervised-ML projects, materializes
 reproducible feature sets, and compares isolated AutoGluon model families on a
-shared validation split. It keeps the test split untouched for a later phase.
+shared validation split. It tunes the best candidates and selects one
+configuration, then `finalize` refits it on train+validation and evaluates it
+once on the test split; every earlier phase leaves that split untouched.
 
 ## Install for development
+
+Requires **Python >= 3.12** (matches `pyproject.toml`). The install is large,
+about 1.3 GB on disk (mostly AutoGluon's CatBoost/SciPy dependencies and MLflow),
+and MLTool has only been tested on Linux x86_64.
 
 ```bash
 python3 -m venv .venv
@@ -16,13 +22,18 @@ python3 -m venv .venv
 ```bash
 mkdir demo && cd demo
 /path/to/graduation-thesis/.venv/bin/mltool init
-# Put the configured CSV or Parquet file in place and edit mltool.yaml as needed.
+# Put the configured CSV or Parquet file in place (see "Input data" below) and
+# edit mltool.yaml as needed.
 /path/to/graduation-thesis/.venv/bin/mltool validate
 /path/to/graduation-thesis/.venv/bin/mltool prepare
 /path/to/graduation-thesis/.venv/bin/mltool features
 /path/to/graduation-thesis/.venv/bin/mltool plan
 /path/to/graduation-thesis/.venv/bin/mltool train
 /path/to/graduation-thesis/.venv/bin/mltool leaderboard
+# `tune` needs an `hpo:` section, which `init` does not write. Append this to
+# mltool.yaml first (a per-candidate time budget in seconds is required):
+#   hpo:
+#     time_limit_seconds: 60
 /path/to/graduation-thesis/.venv/bin/mltool tune
 /path/to/graduation-thesis/.venv/bin/mltool tuning-leaderboard
 /path/to/graduation-thesis/.venv/bin/mltool finalize
@@ -32,6 +43,12 @@ mkdir demo && cd demo
 /path/to/graduation-thesis/.venv/bin/mltool logs
 /path/to/graduation-thesis/.venv/bin/mltool best
 ```
+
+**Input data.** Provide a CSV or Parquet file with one column per feature plus
+exactly one target column whose name matches `task.target` (the `init` template
+assumes `./data/dataset.csv` with a target column named `label`). At least one
+non-target column is required. Unknown or misspelled keys in `mltool.yaml` are
+rejected with `unsupported "<section>" setting(s): <key>`.
 
 Run `mltool validate` from the directory containing `mltool.yaml`; Phase 1 does
 not perform parent-directory config discovery. Dataset paths inside the config
@@ -52,9 +69,9 @@ config-relative `<python-file>:<class-name>` entrypoint, fitted once on train
 features only, and reused for all three transformations.
 
 Prepared artifacts are written to `.mltool/prepared/`. Regression targets that
-contain numeric-looking strings remain unchanged during preparation. TODO for
-the later training phase: decide whether its model integration requires an
-explicit numeric target representation.
+contain numeric-looking strings remain unchanged during preparation; `train`,
+`tune` and `finalize` convert them strictly to numbers on their own copies (the
+result files record `target_conversion_applied`).
 
 `features` reads `.mltool/prepared/` without splitting or preprocessing again.
 Each configured feature plugin is instantiated separately per FeatureSet,

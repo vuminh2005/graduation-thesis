@@ -258,7 +258,13 @@ def _selected_source_columns(
     target: str,
 ) -> list[str]:
     if spec.source_columns == ["*"]:
-        return [column for column in available if column != target]
+        columns = [column for column in available if column != target]
+        if not columns:
+            raise FeatureMaterializationError(
+                f'FeatureSet "{spec.name}" has no source columns; the dataset has no '
+                "columns other than the target"
+            )
+        return columns
     if target in spec.source_columns:
         raise FeatureMaterializationError(
             f'feature set "{spec.name}" may not select configured target column "{target}"'

@@ -159,6 +159,12 @@ def _add_feature_warnings(
     frame: pd.DataFrame,
     target_name: str | None,
 ) -> None:
+    if target_name is not None and not any(name != target_name for name in frame.columns):
+        report.warnings.append(
+            "dataset has no columns other than the target; there are no features to "
+            "build a FeatureSet from"
+        )
+
     duplicate_rows = int(frame.duplicated().sum())
     if duplicate_rows:
         report.warnings.append(f"{duplicate_rows} duplicate row(s) found")

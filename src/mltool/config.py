@@ -36,6 +36,7 @@ METRIC_DIRECTIONS = {
 }
 SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 SAFE_FEATURE_SET_NAME = SAFE_IDENTIFIER
+SAFE_PLUGIN_NAME = SAFE_IDENTIFIER
 
 
 class ConfigError(ValueError):
@@ -157,6 +158,13 @@ class MLToolConfig:
     hpo: HpoConfig | None = None
 
 
+def _reject_unknown(section: dict[str, Any], allowed: set[str], name: str) -> None:
+    """Fail on misspelled keys instead of silently dropping the intended setting."""
+    unknown = sorted(str(key) for key in set(section) - allowed)
+    if unknown:
+        raise ConfigError(f'unsupported "{name}" setting(s): {", ".join(unknown)}')
+
+
 def _mapping(parent: dict[str, Any], key: str) -> dict[str, Any]:
     value = parent.get(key)
     if not isinstance(value, dict):
@@ -208,6 +216,7 @@ def _model_config(raw: dict[str, Any]) -> list[ModelConfig]:
         prefix = f"models[{index}]"
         if not isinstance(model_raw, dict):
             raise ConfigError(f'"{prefix}" must be a mapping')
+        _reject_unknown(model_raw, {"name", "family", "params"}, prefix)
         name = _non_empty_string(model_raw, "name", f"{prefix}.name")
         if not SAFE_IDENTIFIER.fullmatch(name):
             raise ConfigError(
@@ -232,6 +241,7 @@ def _evaluation_config(raw: dict[str, Any], task_type: str) -> EvaluationConfig:
     evaluation_raw = raw.get("evaluation", {})
     if not isinstance(evaluation_raw, dict):
         raise ConfigError('configuration section "evaluation" must be a mapping')
+    _reject_unknown(evaluation_raw, {"primary_metric", "secondary_metrics"}, "evaluation")
     primary = evaluation_raw.get("primary_metric", default_primary)
     if not isinstance(primary, str) or not primary.strip():
         raise ConfigError('"evaluation.primary_metric" must be a non-empty string')
@@ -265,6 +275,7 @@ def _training_config(raw: dict[str, Any]) -> TrainingConfig:
     training_raw = raw.get("training", {})
     if not isinstance(training_raw, dict):
         raise ConfigError('configuration section "training" must be a mapping')
+    _reject_unknown(training_raw, {"time_limit_seconds", "seed"}, "training")
     time_limit = training_raw.get("time_limit_seconds")
     if time_limit is not None and (
         isinstance(time_limit, bool) or not isinstance(time_limit, int) or time_limit <= 0
@@ -293,9 +304,7 @@ def _hpo_config(raw: dict[str, Any]) -> HpoConfig | None:
     hpo_raw = raw["hpo"]
     if not isinstance(hpo_raw, dict):
         raise ConfigError('configuration section "hpo" must be a mapping')
-    unknown = sorted(set(hpo_raw) - {"top_n", "num_trials", "time_limit_seconds"})
-    if unknown:
-        raise ConfigError(f'unsupported "hpo" setting(s): {", ".join(map(str, unknown))}')
+    _reject_unknown(hpo_raw, {"top_n", "num_trials", "time_limit_seconds"}, "hpo")
     return HpoConfig(
         top_n=_positive_int(hpo_raw, "top_n", 3),
         num_trials=_positive_int(hpo_raw, "num_trials", 10),
@@ -312,6 +321,7 @@ def _feature_config(raw: dict[str, Any]) -> FeaturesConfig:
         )
     if not isinstance(features_raw, dict):
         raise ConfigError('configuration section "features" must be a mapping')
+    _reject_unknown(features_raw, {"plugins", "sets"}, "features")
 
     plugins_raw = features_raw.get("plugins", [])
     if not isinstance(plugins_raw, list):
@@ -322,7 +332,13 @@ def _feature_config(raw: dict[str, Any]) -> FeaturesConfig:
         prefix = f"features.plugins[{index}]"
         if not isinstance(plugin_raw, dict):
             raise ConfigError(f'"{prefix}" must be a mapping')
+        _reject_unknown(plugin_raw, {"name", "entrypoint", "params"}, prefix)
         name = _non_empty_string(plugin_raw, "name", f"{prefix}.name")
+        if not SAFE_PLUGIN_NAME.fullmatch(name):
+            raise ConfigError(
+                f'feature plugin name "{name}" is unsafe; use only letters, numbers, '
+                "underscore, and hyphen"
+            )
         if name in plugin_names:
             raise ConfigError(f'duplicate feature plugin name "{name}"')
         plugin_names.add(name)
@@ -355,6 +371,7 @@ def _feature_config(raw: dict[str, Any]) -> FeaturesConfig:
         prefix = f"features.sets[{index}]"
         if not isinstance(set_raw, dict):
             raise ConfigError(f'"{prefix}" must be a mapping')
+        _reject_unknown(set_raw, {"name", "source_columns", "plugins"}, prefix)
         name = _non_empty_string(set_raw, "name", f"{prefix}.name")
         if not SAFE_FEATURE_SET_NAME.fullmatch(name):
             raise ConfigError(
@@ -420,6 +437,12 @@ def load_config(path: Path | str = Path("mltool.yaml")) -> MLToolConfig:
     if not isinstance(raw, dict):
         raise ConfigError("configuration root must be a mapping")
 
+    _reject_unknown(
+        raw,
+        {"schema_version", "project", "task", "data", "validation", "split",
+         "preprocessing", "features", "models", "evaluation", "training", "hpo"},
+        "top-level",
+    )
     schema_version = raw.get("schema_version")
     if schema_version != "0.1":
         raise ConfigError('"schema_version" must be the string "0.1"')
@@ -427,6 +450,9 @@ def load_config(path: Path | str = Path("mltool.yaml")) -> MLToolConfig:
     project_raw = _mapping(raw, "project")
     task_raw = _mapping(raw, "task")
     data_raw = _mapping(raw, "data")
+    _reject_unknown(project_raw, {"name"}, "project")
+    _reject_unknown(task_raw, {"type", "target", "positive_class"}, "task")
+    _reject_unknown(data_raw, {"path", "format"}, "data")
 
     project_name = _non_empty_string(project_raw, "name", "project.name")
     task_type = _non_empty_string(task_raw, "type", "task.type")
@@ -452,6 +478,7 @@ def load_config(path: Path | str = Path("mltool.yaml")) -> MLToolConfig:
     validation_raw = raw.get("validation", {})
     if not isinstance(validation_raw, dict):
         raise ConfigError('configuration section "validation" must be a mapping')
+    _reject_unknown(validation_raw, {"enabled", "fail_on_error"}, "validation")
     validation = ValidationConfig(
         enabled=_boolean(validation_raw, "enabled", True, "validation.enabled"),
         fail_on_error=_boolean(
@@ -462,6 +489,9 @@ def load_config(path: Path | str = Path("mltool.yaml")) -> MLToolConfig:
     split_raw = raw.get("split", {})
     if not isinstance(split_raw, dict):
         raise ConfigError('configuration section "split" must be a mapping')
+    _reject_unknown(
+        split_raw, {"validation_ratio", "test_ratio", "stratify", "random_seed"}, "split"
+    )
     validation_ratio = _ratio(split_raw, "validation_ratio", 0.15)
     test_ratio = _ratio(split_raw, "test_ratio", 0.15)
     if validation_ratio + test_ratio >= 1:
@@ -484,9 +514,13 @@ def load_config(path: Path | str = Path("mltool.yaml")) -> MLToolConfig:
     preprocessing_raw = raw.get("preprocessing", {})
     if not isinstance(preprocessing_raw, dict):
         raise ConfigError('configuration section "preprocessing" must be a mapping')
+    _reject_unknown(preprocessing_raw, {"external"}, "preprocessing")
     external_raw = preprocessing_raw.get("external", {})
     if not isinstance(external_raw, dict):
         raise ConfigError('"preprocessing.external" must be a mapping')
+    _reject_unknown(
+        external_raw, {"enabled", "entrypoint", "params"}, "preprocessing.external"
+    )
     external_enabled = _boolean(
         external_raw, "enabled", False, "preprocessing.external.enabled"
     )
