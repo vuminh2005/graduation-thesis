@@ -22,7 +22,14 @@ from mltool.autogluon_adapter import (
     _check_trained_models,
     effective_model_seed,
 )
-from mltool.cli import finalize_project, register_project, train_project, tune_project
+from mltool.cli import (
+    best_project,
+    final_result_project,
+    finalize_project,
+    register_project,
+    train_project,
+    tune_project,
+)
 from mltool.config import ConfigError, ModelConfig, TaskConfig, TrainingConfig, load_config
 from mltool.experiment import build_experiment_plan
 from mltool.finalize import finalize_experiment, load_finalize_input
@@ -272,6 +279,36 @@ def test_ensemble_fit_final_kwargs_and_refit(tmp_path: Path) -> None:
     assert output.best_hyperparameters == {"GBM": {"seed": 13}, "RF": {"random_state": 13}}
 
 
+def test_ensemble_fit_final_with_no_bagging_still_refits_full_with_time_limit(
+    tmp_path: Path,
+) -> None:
+    """Fix 3: the num_bag_folds=0 path, confirmed for real on Titanic-shaped data;
+    locked in here with the exact model-name shape AutoGluon actually produced."""
+    factory = ensemble_predictor_factory(
+        ["LightGBM", "RandomForest", "WeightedEnsemble_L2",
+         "LightGBM_FULL", "RandomForest_FULL", "WeightedEnsemble_L2_FULL"],
+        "WeightedEnsemble_L2_FULL",
+        final=True,
+    )
+    adapter = AutoGluonAdapter(predictor_factory=factory, version_resolver=lambda: "t")
+    output = adapter.fit_final(
+        train_data=pd.DataFrame({"x": [1, 2, 3], "label": ["no", "yes", "no"]}),
+        test_features=pd.DataFrame({"x": [4, 5]}),
+        task=TaskConfig("binary", "label", "yes"),
+        model=ModelConfig("ag_ensemble", "ENSEMBLE", {}),
+        best_hyperparameters={"families": ["GBM", "RF"], "num_bag_folds": 0, "num_stack_levels": 0},
+        effective_seed=9,
+        primary_metric="roc_auc",
+        predictor_path=tmp_path / "p",
+        training=TrainingConfig(time_limit_seconds=60),
+    )
+    fit = factory.fit_kwargs
+    assert fit["num_bag_folds"] == 0 and fit["num_stack_levels"] == 0
+    assert fit["time_limit"] == 60
+    assert fit["refit_full"] is True and fit["set_best_to_refit_full"] is True
+    assert output.best_model == "WeightedEnsemble_L2_FULL"
+
+
 # =========================== trained-model guards ==============================
 
 
@@ -288,6 +325,46 @@ def test_check_ensemble_trained_models_accepts_members_and_weighted_ensemble() -
         ["LightGBM_BAG_L1", "CatBoost_BAG_L1", "WeightedEnsemble_L2", "LightGBM_BAG_L1_FULL"],
         ["GBM", "CAT"],
     )
+
+
+def test_check_ensemble_trained_models_accepts_every_real_name_shape_observed() -> None:
+    """Every shape seen across the Phase 8 real runs (Titanic, regression, multiclass)."""
+    _check_ensemble_trained_models(
+        [
+            "LightGBM_BAG_L1", "RandomForest_BAG_L1", "CatBoost_BAG_L1", "ExtraTrees_BAG_L1",
+            "XGBoost_BAG_L1", "WeightedEnsemble_L2", "LightGBM_BAG_L2", "RandomForest_BAG_L2",
+            "CatBoost_BAG_L2", "ExtraTrees_BAG_L2", "XGBoost_BAG_L2", "WeightedEnsemble_L3",
+        ],
+        ["GBM", "CAT", "XGB", "RF", "XT"],
+    )
+    _check_ensemble_trained_models(  # finalize's refit_full, num_stack_levels=0
+        ["LightGBM_BAG_L1", "RandomForest_BAG_L1", "WeightedEnsemble_L2",
+         "LightGBM_BAG_L1_FULL", "RandomForest_BAG_L1_FULL", "WeightedEnsemble_L2_FULL"],
+        ["GBM", "RF"],
+    )
+    _check_ensemble_trained_models(  # no bagging: num_bag_folds=0
+        ["LightGBM", "RandomForest", "WeightedEnsemble_L2"], ["GBM", "RF"]
+    )
+    _check_ensemble_trained_models(  # no bagging, after refit_full
+        ["LightGBM_FULL", "RandomForest_FULL", "WeightedEnsemble_L2_FULL"], ["GBM", "RF"]
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "WeightedEnsembleX_L2",  # extra text: the old substring check let this through
+        "WeightedEnsemble_L2_PARTIAL",  # near-miss suffix
+        "WeightedEnsemble",  # missing the stack-level suffix entirely
+        "LightGBMFake_BAG_L1",  # "LightGBM" only as a substring, not the real token
+        "LightGBM_BAG_L1_2",  # malformed suffix, not "_FULL"
+        "NotLightGBM_BAG_L1",  # token embedded, not a prefix match
+        "LightGBM_BAG_LX",  # non-numeric fold level
+    ],
+)
+def test_check_ensemble_trained_models_rejects_near_miss_names(name: str) -> None:
+    with pytest.raises(AutoGluonError, match="outside the configured ensemble families"):
+        _check_ensemble_trained_models(["LightGBM_BAG_L1", name], ["GBM"])
 
 
 def test_check_ensemble_trained_models_rejects_a_foreign_family() -> None:
@@ -552,6 +629,57 @@ def test_finalize_and_registry_and_mlflow_record_the_ensemble_config(
     assert run.data.params["hp.num_bag_folds"] == "3"
     assert run.data.params["hp.num_stack_levels"] == "1"
     assert run.data.tags["test_data_used"] == "true"
+
+
+# =========================== Fix 1: accurate "Tuned" line for ENSEMBLE =========
+
+
+def test_tuned_line_wording_for_ensemble_vs_rf() -> None:
+    from mltool.finalize import tuned_line
+
+    assert tuned_line({"hpo_effective": False, "model": {"family": "ENSEMBLE"}}) == (
+        "Tuned: no (HPO is not applied to ENSEMBLE candidates)"
+    )
+    # RF/XT wording is unchanged.
+    assert tuned_line({"hpo_effective": False, "model": {"family": "RF"}}) == (
+        "Tuned: no (family RF has no HPO search space)"
+    )
+    assert tuned_line({"hpo_effective": True, "model": {"family": "ENSEMBLE"}}) == "Tuned: yes"
+
+
+def test_finalize_final_result_and_best_report_the_ensemble_wording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = ensemble_project(tmp_path, models=[ensemble_model(families=["GBM", "RF"])])
+    monkeypatch.setattr(
+        "mltool.cli.train_experiment",
+        lambda plan: train_experiment(plan, adapter_factory=EnsembleAwareAdapter),
+    )
+    monkeypatch.setattr(
+        "mltool.cli.tune_experiment",
+        lambda plan, sel: tune_experiment(plan, sel, adapter_factory=EnsembleAwareAdapter),
+    )
+    monkeypatch.setattr(
+        "mltool.cli.finalize_experiment",
+        lambda plan, inp: finalize_experiment(plan, inp, adapter_factory=EnsembleFinalAdapter),
+    )
+    assert train_project(path) == 0
+    assert tune_project(path) == 0
+    capsys.readouterr()
+    assert finalize_project(path) == 0
+    expected = "Tuned: no (HPO is not applied to ENSEMBLE candidates)"
+    out = capsys.readouterr().out
+    assert expected in out and "has no HPO search space" not in out
+
+    capsys.readouterr()
+    assert final_result_project(path) == 0
+    assert expected in capsys.readouterr().out
+
+    assert register_project(path) == 0
+    capsys.readouterr()
+    assert best_project(path) == 0
+    out = capsys.readouterr().out
+    assert out.count(expected) == 2  # the finalized model and the registered version
 
 
 def test_finalize_cli_and_register_cli_work_with_an_ensemble_winner(

@@ -145,6 +145,8 @@ def tuned_line(record: dict[str, Any]) -> str | None:
     if effective:
         return "Tuned: yes"
     family = record.get("model", {}).get("family", "?")
+    if family == "ENSEMBLE":
+        return "Tuned: no (HPO is not applied to ENSEMBLE candidates)"
     return f"Tuned: no (family {family} has no HPO search space)"
 
 

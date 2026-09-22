@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
+import re
 from typing import Any, Callable
 
 import pandas as pd
@@ -111,18 +112,36 @@ def _check_trained_models(trained_models: list[str], family: str) -> None:
         )
 
 
+# Exact shapes observed from real AutoGluon 1.6 ensemble runs (Titanic and the
+# regression/multiclass smoke tests): a stack level suffix ("_L2", "_L3", ...)
+# on the weighted ensemble, an optional bag-fold group ("_BAG_L1", "_BAG_L2",
+# ...) on a member family that is only absent when num_bag_folds=0, and an
+# optional "_FULL" suffix once refit_full collapses everything onto one model.
+_WEIGHTED_ENSEMBLE_PATTERN = re.compile(r"^WeightedEnsemble_L\d+(_FULL)?$")
+
+
+def _member_family_pattern(token: str) -> re.Pattern[str]:
+    return re.compile(rf"^{re.escape(token)}(_BAG_L\d+)?(_FULL)?$")
+
+
 def _check_ensemble_trained_models(trained_models: list[str], families: list[str]) -> None:
     """The ENSEMBLE-candidate guard: only the configured member families (bagged,
     stacked, or refit ``_FULL`` variants) and AutoGluon's own weighted ensemble
-    are allowed; a foreign family is still rejected.
+    are allowed, matched by exact pattern rather than substring; a foreign
+    family or an unrecognized name shape is still rejected.
     """
     if not trained_models:
         raise AutoGluonError("AutoGluon did not train a usable model")
-    expected_tokens = [token for family in families for token in FAMILY_MODEL_TOKENS[family]]
+    member_patterns = [
+        _member_family_pattern(token)
+        for family in families
+        for token in FAMILY_MODEL_TOKENS[family]
+    ]
     unrelated = [
         name
         for name in trained_models
-        if "WeightedEnsemble" not in name and not any(token in name for token in expected_tokens)
+        if not _WEIGHTED_ENSEMBLE_PATTERN.fullmatch(name)
+        and not any(pattern.fullmatch(name) for pattern in member_patterns)
     ]
     if unrelated:
         raise AutoGluonError(
