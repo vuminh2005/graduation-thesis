@@ -462,7 +462,9 @@ def test_train_scores_every_fold_and_persists_them(tmp_path: Path) -> None:
 
     out = result.render()
     assert "Cross-validation" in out and "4 folds x 2 repeat(s) = 8 fits per candidate" in out
-    assert "+/-" in out and "(8 folds)" in out
+    # the spread is labelled as the across-fold sd, not as an uncertainty of the mean
+    assert "(fold sd " in out and ", 8 folds)" in out and "+/-" not in out
+    assert "Folds from repeated CV are correlated; fold sd is not a standard error." in out
 
 
 def test_leaderboard_ranks_by_cv_mean_in_both_directions() -> None:
@@ -746,3 +748,82 @@ def test_plugin_inputs_default_keeps_the_old_frame(tmp_path: Path) -> None:
     )
     assert built.manifest["final_feature_columns"] == ["x", "z", "z_centered"]
     assert built.manifest["plugin_inputs"] == []
+
+
+# =========================== audit fix: honest labelling ======================
+
+
+def test_fold_spread_is_labelled_as_a_fold_sd_not_an_uncertainty() -> None:
+    from mltool.training import CORRELATED_FOLDS_NOTE, _fold_sd_note, format_score
+
+    assert format_score(0.879769, 0.032235, 15) == "0.879769 (fold sd 0.032235, 15 folds)"
+    assert format_score(0.879769, None, None) == "0.879769"  # holdout is unchanged
+    assert "+/-" not in format_score(0.5, 0.1, 3)
+    # the correlated-folds caveat appears only when repeats actually create it
+    assert _fold_sd_note({"repeats": 3}) == [f"  {CORRELATED_FOLDS_NOTE}"]
+    assert _fold_sd_note({"repeats": 1}) == []
+    assert _fold_sd_note(None) == []
+
+
+def test_repeated_cv_note_appears_under_train_and_tune_leaderboards(tmp_path: Path) -> None:
+    from mltool.training import CORRELATED_FOLDS_NOTE
+
+    path = cv_project(tmp_path, cv={"folds": 3, "repeats": 2})
+    hpo_raw(path, top_n=1)
+    train = run_train(path)
+    assert CORRELATED_FOLDS_NOTE in train.render()
+    plan = build_experiment_plan(load_config(path))
+    tuned = tune_experiment(plan, build_tuning_selection(plan), adapter_factory=CvFakeAdapter)
+    assert CORRELATED_FOLDS_NOTE in tuned.render()
+
+    from mltool.training import load_persisted_leaderboard
+    from mltool.tuning import load_persisted_tuning
+
+    config = load_config(path)
+    assert CORRELATED_FOLDS_NOTE in load_persisted_leaderboard(config).render()
+    assert CORRELATED_FOLDS_NOTE in load_persisted_tuning(config).render()
+
+
+def test_single_repeat_cv_omits_the_correlation_note(tmp_path: Path) -> None:
+    from mltool.training import CORRELATED_FOLDS_NOTE
+
+    path = cv_project(tmp_path, cv={"folds": 3, "repeats": 1})
+    out = run_train(path).render()
+    assert "(fold sd " in out and CORRELATED_FOLDS_NOTE not in out
+
+
+def test_final_result_labels_the_validation_number_as_a_cv_mean(tmp_path: Path) -> None:
+    from mltool.finalize import load_persisted_final
+    from mltool.training import CORRELATED_FOLDS_NOTE
+
+    path = cv_project(tmp_path, cv={"folds": 3, "repeats": 2})
+    hpo_raw(path, top_n=1)
+    run_train(path)
+    plan = build_experiment_plan(load_config(path))
+    tune_experiment(plan, build_tuning_selection(plan), adapter_factory=CvFakeAdapter)
+    selected = json.loads((tmp_path / ".mltool/tuning/selected.json").read_text())
+    assert selected["cv"]["folds"] == 3 and "fold_metrics" not in selected["cv"]
+
+    FinalAdapter.calls = []
+    plan = build_experiment_plan(load_config(path))
+    result = finalize_experiment(plan, load_finalize_input(plan), adapter_factory=FinalAdapter)
+    rendered = result.render()
+    assert "Tuned validation roc_auc (CV mean): " in rendered
+    assert "(fold sd " in rendered and ", 6 folds)" in rendered
+    assert CORRELATED_FOLDS_NOTE in rendered
+    assert "Tuned validation roc_auc (CV mean): " in load_persisted_final(load_config(path)).render()
+
+
+def test_final_result_without_cv_keeps_the_plain_wording(tmp_path: Path) -> None:
+    path = cv_project(tmp_path)  # no cv section
+    hpo_raw(path, top_n=1)
+    run_train(path)
+    plan = build_experiment_plan(load_config(path))
+    tune_experiment(plan, build_tuning_selection(plan), adapter_factory=CvFakeAdapter)
+    FinalAdapter.calls = []
+    plan = build_experiment_plan(load_config(path))
+    rendered = finalize_experiment(
+        plan, load_finalize_input(plan), adapter_factory=FinalAdapter
+    ).render()
+    assert "Tuned validation roc_auc: " in rendered
+    assert "CV mean" not in rendered and "fold sd" not in rendered

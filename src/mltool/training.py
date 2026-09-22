@@ -89,6 +89,7 @@ class TrainingResult:
                 f"  {row['rank']}. {row['feature_set']} x {row['model']}   "
                 f"{self.primary_metric}={score}"
             )
+        lines.extend(_fold_sd_note(self.cv))
         if self.failed_count:
             lines.extend(["", f"Warnings", f"  ! {self.failed_count} candidate(s) failed"])
         lines.extend(
@@ -134,17 +135,33 @@ class PersistedLeaderboard:
                 f"{rank:<5} {row['feature_set']:<11} {row['model']:<16} "
                 f"{row['family']:<6} {score:<10} {seconds:<8} {row['status']}"
             )
+        lines.extend(_fold_sd_note(self.manifest.get("cv")))
         if self.warning:
             lines.extend(["", "Warnings", f"  ! {self.warning}"])
         lines.extend(["", "Test split: NOT USED"])
         return "\n".join(lines)
 
 
+# Spelled out rather than "+/-", which reads as the uncertainty of the mean. It
+# is the spread of the per-fold scores, and with repeats the folds are not
+# independent, so it is not a standard error either.
+CORRELATED_FOLDS_NOTE = (
+    "Folds from repeated CV are correlated; fold sd is not a standard error."
+)
+
+
 def format_score(value: float, std: float | None, folds: int | None) -> str:
-    """``0.912345`` for a holdout score, ``0.912345 +/- 0.021 (15 folds)`` for a CV mean."""
+    """``0.912345`` for a holdout score, ``0.912345 (fold sd 0.021, 15 folds)`` for a CV mean."""
     if std is None or folds is None:
         return f"{value:.6f}"
-    return f"{value:.6f} +/- {std:.6f} ({folds} folds)"
+    return f"{value:.6f} (fold sd {std:.6f}, {folds} folds)"
+
+
+def _fold_sd_note(cv: dict[str, Any] | None) -> list[str]:
+    """Warn about correlated folds only when repeats actually create them."""
+    if cv and cv.get("repeats", 1) > 1:
+        return [f"  {CORRELATED_FOLDS_NOTE}"]
+    return []
 
 
 def _row_score_parts(row: dict[str, Any]) -> tuple[float | None, int | None]:

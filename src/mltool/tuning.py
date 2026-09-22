@@ -38,6 +38,7 @@ from mltool.training import (
     build_leaderboard,
     format_score,
     _cv_header,
+    _fold_sd_note,
     _row_score_parts,
 )
 
@@ -147,6 +148,7 @@ class TuningResult:
                     f"  {row['rank']}. {row['feature_set']} x {row['model']}   "
                     f"{self.primary_metric}={score}"
                 )
+        lines.extend(_fold_sd_note(self.cv))
         warnings = []
         if self.warning:
             warnings.append(self.warning)
@@ -209,6 +211,7 @@ class PersistedTuning:
                 f"{rank:<5} {row['feature_set']:<11} {row['model']:<16} "
                 f"{row['family']:<6} {score:<10} {seconds:<8} {row['status']}"
             )
+        lines.extend(_fold_sd_note(self.manifest.get("cv")))
         selected = self.manifest.get("selected_candidate_id")
         lines.extend(["", f"Selected: {selected if selected else 'none'}"])
         if self.warning:
@@ -468,10 +471,14 @@ def build_selected_configuration(
         return None
     best_id = ranked[0]["candidate_id"]
     result = next(item for item in candidate_results if item["candidate_id"] == best_id)
+    cv = result.get("cv")
     return {
         "candidate_id": result["candidate_id"],
         "feature_set": result["feature_set"],
         "model": result["model"],
+        # the fold-level summary, without the per-fold detail, so `finalize` and
+        # `final-result` can label the validation number as a CV mean
+        **({"cv": {k: v for k, v in cv.items() if k != "fold_metrics"}} if cv else {}),
         "best_hyperparameters": result["best_hyperparameters"],
         "best_model": result["best_model"],
         "hpo_effective": result["hpo_effective"],

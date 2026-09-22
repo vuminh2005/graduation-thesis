@@ -29,12 +29,14 @@ from mltool.feature_materialization import (
 from mltool.preprocessing import PreprocessingError, preprocess_frames
 from mltool.splitting import SplitError, should_stratify, split_dataset
 from mltool.training import (
+    CORRELATED_FOLDS_NOTE,
     TrainingError,
     _commit_staged_directory,
     _config_signature,
     _manifest_cv_signature,
     convert_regression_targets,
     cv_signature,
+    format_score,
 )
 from mltool.tuning import (
     TuningError,
@@ -90,8 +92,7 @@ class FinalModelResult:
         lines.extend(
             [
                 "",
-                f"Tuned validation {self.primary_metric}: "
-                f"{result['selected_validation_score']:.6f}",
+                *validation_score_line(result, self.primary_metric),
                 f"time={result['training_seconds']:.2f}s",
                 "",
                 "Test split",
@@ -126,14 +127,32 @@ class PersistedFinal:
             lines.append(tuned)
         lines.extend(["", f"Test metrics ({result['rows']['test']} rows)"])
         lines.extend(f"  {metric}={value:.6f}" for metric, value in result["metrics"].items())
-        lines.append(
-            f"Tuned validation {result['primary_metric']}: "
-            f"{result['selected_validation_score']:.6f}"
-        )
+        lines.extend(validation_score_line(result, result["primary_metric"]))
         if self.warning:
             lines.extend(["", "Warnings", f"  ! {self.warning}"])
         lines.extend(["", "Test split: USED (evaluated once)"])
         return "\n".join(lines)
+
+
+def validation_score_line(result: dict[str, Any], primary_metric: str) -> list[str]:
+    """The selected configuration's validation score, labelled by how it was measured.
+
+    With cross-validation the number is the mean over folds, so it is shown with
+    the spread of the per-fold scores rather than as a bare figure.
+    """
+    score = result["selected_validation_score"]
+    cv = result.get("selected_validation_cv")
+    if not cv:
+        return [f"Tuned validation {primary_metric}: {score:.6f}"]
+    std = (cv.get("metric_std") or {}).get(primary_metric)
+    folds = cv.get("total_fits_per_candidate")
+    lines = [
+        f"Tuned validation {primary_metric} (CV mean): "
+        f"{format_score(score, std, folds)}"
+    ]
+    if cv.get("repeats", 1) > 1:
+        lines.append(CORRELATED_FOLDS_NOTE)
+    return lines
 
 
 def tuned_line(record: dict[str, Any]) -> str | None:
@@ -434,6 +453,7 @@ def finalize_experiment(
             "primary_metric": config.evaluation.primary_metric,
             "metrics": metrics,
             "selected_validation_score": selected["tuned_validation_score"],
+            **({"selected_validation_cv": selected["cv"]} if selected.get("cv") else {}),
             "best_hyperparameters": selected["best_hyperparameters"],
             "hpo_effective": selected.get("hpo_effective"),
             "hpo_warning": selected.get("hpo_warning"),

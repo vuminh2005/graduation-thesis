@@ -207,6 +207,53 @@ Absent, everything behaves exactly as before. With it:
 - Folds run sequentially to bound memory. `train` and `tune` print the total
   number of fits up front and one progress line per fold, both on stderr.
 
+**Reading a CV result.** The leaderboards print
+`roc_auc=0.879769 (fold sd 0.032235, 15 folds)`. The second number is the
+**standard deviation of the per-fold scores**, not the uncertainty of the mean,
+and it is deliberately not written as `+/-`:
+
+- *Fold sd* says how much the score moves between folds. It is driven mostly by
+  how hard each fold's held-out rows happen to be, and it does not shrink as you
+  add repeats.
+- *Uncertainty of the mean* is the quantity you want when asking "is this
+  candidate really better". For independent folds it would be roughly
+  `fold sd / sqrt(n)`, but folds from `repeats > 1` reuse the same rows in
+  different partitions, so they are correlated and that formula understates the
+  true uncertainty. When `repeats > 1` the leaderboard prints a reminder of
+  exactly this.
+
+**Comparing two FeatureSets.** Do not compare the two printed means and their
+fold sds as if they were independent samples: on a small dataset the fold sd
+(~0.03) will swamp a real difference (~0.01) and everything will look tied.
+Every candidate in a run is scored on the *same* fold assignment (its
+fingerprint is in the manifest), so the informative comparison is the
+**per-fold paired difference** for the same model family:
+
+```python
+import json
+folds = lambda cid: {                                  # per-fold primary metric
+    (f["repeat"], f["fold"]): f["metrics"]["roc_auc"]
+    for f in json.load(open(f".mltool/training/candidates/{cid}/result.json"))["cv"]["fold_metrics"]
+}
+a, b = folds("base__lgbm"), folds("replaced__lgbm")
+diffs = [b[k] - a[k] for k in sorted(a)]               # paired, same folds
+```
+
+Pairing cancels fold difficulty, so the spread of `diffs` is far smaller than
+either fold sd. On the Titanic check this turned a ±0.03 fold sd into a paired
+standard error of ~0.003, which separated the two FeatureSets for the boosting
+families while leaving RF/XT/ENSEMBLE indistinguishable. Treat the result as
+evidence about ordering, not as a p-value: repeated folds are still correlated,
+so a naive paired t-test over them overstates significance.
+
+**Tuned CV means are mildly optimistic.** `tune` searches hyperparameters on the
+train split and then cross-validates the winner over folds drawn from the same
+development rows, so the hyperparameters have seen part of every fold's training
+data. The tuned CV mean is therefore a slightly generous estimate, and the gap
+to the test score is usually larger than the gap between two tuned CV means.
+Nested cross-validation would remove this and is out of scope. `finalize`'s test
+score remains the only estimate computed on rows no phase has touched.
+
 **Replacing a column with a plugin output.** A feature plugin only ever adds
 columns, so a plugin that reads `Age` to build `Age_group` would normally force
 `Age` to stay in the FeatureSet. `plugin_inputs` lists columns the plugins may
