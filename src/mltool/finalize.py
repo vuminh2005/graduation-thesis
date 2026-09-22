@@ -32,7 +32,9 @@ from mltool.training import (
     TrainingError,
     _commit_staged_directory,
     _config_signature,
+    _manifest_cv_signature,
     convert_regression_targets,
+    cv_signature,
 )
 from mltool.tuning import (
     TuningError,
@@ -194,6 +196,7 @@ def load_finalize_input(plan: ExperimentPlan) -> FinalizeInput:
         "target": tuning_manifest.get("target"),
         "primary_metric": tuning_manifest.get("primary_metric"),
         "secondary_metrics": tuning_manifest.get("secondary_metrics"),
+        "cv": _manifest_cv_signature(tuning_manifest),
         "feature_sets": [
             entry.get("name")
             for entry in tuning_manifest.get("feature_sets", [])
@@ -475,6 +478,7 @@ def finalize_experiment(
             "primary_metric": config.evaluation.primary_metric,
             "secondary_metrics": config.evaluation.secondary_metrics,
             "metric_direction": config.evaluation.direction,
+            **({"cv": cv_signature(config)} if cv_signature(config) else {}),
             "autogluon_version": output.autogluon_version,
             "selected": {
                 "candidate_id": candidate.candidate_id,
@@ -585,6 +589,7 @@ def load_persisted_final(config: MLToolConfig) -> PersistedFinal:
         "target": manifest.get("target"),
         "primary_metric": manifest.get("primary_metric"),
         "secondary_metrics": manifest.get("secondary_metrics"),
+        "cv": _manifest_cv_signature(manifest),
         "feature_sets": [
             entry.get("name") for entry in manifest.get("feature_sets", [])
             if isinstance(entry, dict)

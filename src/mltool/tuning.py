@@ -18,16 +18,27 @@ from mltool.autogluon_adapter import (
     AutoGluonError,
     effective_model_seed,
 )
-from mltool.config import MLToolConfig, TrainingConfig
+from mltool.config import MLToolConfig, ModelConfig, TrainingConfig
 from mltool.evaluation import EvaluationError, evaluate_predictions
 from mltool.experiment import CandidateSpec, ExperimentPlan, sha256_file
+from mltool.cross_validation import (
+    CrossValidationError,
+    build_cv_plan,
+    cost_warning,
+    cv_score_candidate,
+    progress,
+)
 from mltool.training import (
     TrainingError,
     _autogluon_version,
     _commit_staged_directory,
     _config_signature,
+    _manifest_cv_signature,
     _prepare_candidate_frames,
     build_leaderboard,
+    format_score,
+    _cv_header,
+    _row_score_parts,
 )
 
 
@@ -80,6 +91,7 @@ class TuningResult:
     candidate_results: list[dict[str, Any]]
     leaderboard: list[dict[str, Any]]
     selected: dict[str, Any] | None
+    cv: dict[str, Any] | None = None
 
     @property
     def successful_count(self) -> int:
@@ -103,6 +115,7 @@ class TuningResult:
             "Candidates",
             f"  {len(self.candidate_results)}",
         ]
+        lines.extend(_cv_header(self.cv))
         total = len(self.candidate_results)
         for index, result in enumerate(self.candidate_results, start=1):
             lines.extend(
@@ -115,17 +128,24 @@ class TuningResult:
             )
             if result["status"] == "SUCCEEDED":
                 lines.append(f"      trained models (trials): {len(result['trained_models'])}")
+                cv = result.get("cv")
+                std = cv["metric_std"] if cv else None
+                folds = cv["total_fits_per_candidate"] if cv else None
                 for metric, value in result["metrics"].items():
-                    lines.append(f"      {metric}={value:.6f}")
+                    lines.append(
+                        f"      {metric}="
+                        f"{format_score(value, std[metric] if std else None, folds)}"
+                    )
                 lines.append(f"      time={result['training_seconds']:.2f}s")
             else:
                 lines.append(f"      error: {result['error_message']}")
         lines.extend(["", "Tuned leaderboard"])
         for row in self.leaderboard:
             if row["status"] == "SUCCEEDED":
+                score = format_score(row["primary_score"], *_row_score_parts(row))
                 lines.append(
                     f"  {row['rank']}. {row['feature_set']} x {row['model']}   "
-                    f"{self.primary_metric}={row['primary_score']:.6f}"
+                    f"{self.primary_metric}={score}"
                 )
         warnings = []
         if self.warning:
@@ -170,13 +190,15 @@ class PersistedTuning:
             "",
             f"Primary metric: {self.manifest['primary_metric']} "
             f"({self.manifest['metric_direction']})",
-            "",
-            "Rank  FeatureSet  Model  Family  Score  Time  Status",
         ]
+        lines.extend(_cv_header(self.manifest.get("cv")))
+        lines.extend(["", "Rank  FeatureSet  Model  Family  Score  Time  Status"])
         for row in self.rows:
             rank = str(row["rank"]) if row["rank"] is not None else "-"
             score = (
-                f"{row['primary_score']:.6f}" if row.get("primary_score") is not None else "-"
+                format_score(row["primary_score"], *_row_score_parts(row))
+                if row.get("primary_score") is not None
+                else "-"
             )
             seconds = (
                 f"{row['training_seconds']:.2f}s"
@@ -225,6 +247,7 @@ def _validate_training_freshness(plan: ExperimentPlan, manifest: dict[str, Any])
         "target": manifest.get("target"),
         "primary_metric": manifest.get("primary_metric"),
         "secondary_metrics": manifest.get("secondary_metrics"),
+        "cv": _manifest_cv_signature(manifest),
         "feature_sets": [
             entry.get("name")
             for entry in manifest.get("feature_sets", [])
@@ -297,6 +320,23 @@ def build_tuning_selection(plan: ExperimentPlan) -> TuningSelection:
     return TuningSelection(rows=selected_rows, candidates=candidates, warning=warning)
 
 
+def tuned_model_config(
+    candidate: CandidateSpec, best_hyperparameters: dict[str, Any] | None, hpo_effective: bool
+) -> ModelConfig:
+    """The configuration to cross-validate after HPO.
+
+    When HPO actually searched, the fixed winning hyperparameters; otherwise
+    (RF/XT with no search space, and ENSEMBLE) the candidate's own configuration.
+    """
+    if hpo_effective and isinstance(best_hyperparameters, dict):
+        return ModelConfig(
+            name=candidate.model.name,
+            family=candidate.model.family,
+            params=dict(best_hyperparameters),
+        )
+    return candidate.model
+
+
 def _tune_candidate(
     plan: ExperimentPlan,
     candidate: CandidateSpec,
@@ -305,6 +345,8 @@ def _tune_candidate(
     staging_candidate_path: Path,
     final_candidate_path: Path,
     adapter: AutoGluonAdapter,
+    cv_plan: Any | None = None,
+    cv_adapter_factory: Callable[[], AutoGluonAdapter] | None = None,
 ) -> dict[str, Any]:
     assert plan.config.hpo is not None
     started = time.perf_counter()
@@ -334,6 +376,27 @@ def _tune_candidate(
         probabilities=output.probabilities,
         positive_class=output.positive_class,
     )
+    cv_record: dict[str, Any] | None = None
+    holdout_metrics: dict[str, float] | None = None
+    if cv_plan is not None:
+        # Re-score the tuned configuration across the folds with its
+        # hyperparameters fixed; the HPO search above stays on the train split.
+        spec = next(
+            item for item in plan.config.features.sets if item.name == candidate.feature_set.name
+        )
+        catalog = {plugin.name: plugin for plugin in plan.config.features.plugins}
+        score = cv_score_candidate(
+            plan.config,
+            cv_plan,
+            spec,
+            tuned_model_config(candidate, output.best_hyperparameters, hpo_warning is None),
+            catalog,
+            adapter_factory=cv_adapter_factory,
+            label=f"{candidate.candidate_id} (tuned)",
+        )
+        holdout_metrics = metrics
+        metrics = score.metrics
+        cv_record = score.as_record(cv_plan)
     return {
         "candidate_id": candidate.candidate_id,
         "feature_set": candidate.feature_set.name,
@@ -349,6 +412,7 @@ def _tune_candidate(
         "task": plan.config.task.type,
         "primary_metric": plan.config.evaluation.primary_metric,
         "metrics": metrics,
+        **({"cv": cv_record, "holdout_metrics": holdout_metrics} if cv_record else {}),
         "phase4_primary_score": phase4_score,
         "positive_class": output.positive_class,
         "target_conversion_applied": converted,
@@ -451,6 +515,14 @@ def tune_experiment(
         raise TuningError(f"could not create tuning workspace: {exc}") from exc
 
     adapter_factory = adapter_factory or AutoGluonAdapter
+    cv_plan = None
+    if config.evaluation.cv is not None:
+        try:
+            cv_plan = build_cv_plan(config)
+        except CrossValidationError as exc:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise TuningError(str(exc)) from exc
+        progress(cost_warning(len(selection.candidates), cv_plan, "tune"))
     candidate_results: list[dict[str, Any]] = []
     try:
         # Strictly sequential: one candidate (and one local trial) at a time.
@@ -466,6 +538,8 @@ def tune_experiment(
                     staging_candidate_path=staging_candidate,
                     final_candidate_path=final_candidate,
                     adapter=adapter_factory(),
+                    cv_plan=cv_plan,
+                    cv_adapter_factory=adapter_factory,
                 )
             except (TrainingError, AutoGluonError, EvaluationError) as exc:
                 result = _failure(candidate, str(exc), config.training)
@@ -525,6 +599,7 @@ def tune_experiment(
                 for artifact in plan.feature_sets
             ],
             "candidate_ids": [candidate.candidate_id for candidate in selection.candidates],
+            **({"cv": cv_plan.summary()} if cv_plan is not None else {}),
             "selection_warning": selection.warning,
             "successful_count": succeeded,
             "failed_count": len(candidate_results) - succeeded,
@@ -552,6 +627,7 @@ def tune_experiment(
         candidate_results=candidate_results,
         leaderboard=leaderboard,
         selected=selected,
+        cv=cv_plan.summary() if cv_plan is not None else None,
     )
 
 
@@ -573,6 +649,7 @@ def load_persisted_tuning(config: MLToolConfig) -> PersistedTuning:
         "target": manifest.get("target"),
         "primary_metric": manifest.get("primary_metric"),
         "secondary_metrics": manifest.get("secondary_metrics"),
+        "cv": _manifest_cv_signature(manifest),
         "feature_sets": [
             entry.get("name") for entry in manifest.get("feature_sets", [])
             if isinstance(entry, dict)

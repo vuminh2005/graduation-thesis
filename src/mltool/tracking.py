@@ -41,6 +41,21 @@ def _flatten(prefix: str, values: dict[str, Any] | None) -> dict[str, Any]:
     return {f"{prefix}.{key}": value for key, value in (values or {}).items()}
 
 
+def _cv_metrics(result: dict[str, Any]) -> tuple[dict[str, float], list[dict[str, Any]], dict[str, Any]]:
+    """Std metrics, the per-fold series and cv params for a cross-validated result."""
+    cv = result.get("cv")
+    if not cv:
+        return {}, [], {}
+    std = {f"{name}_std": value for name, value in cv.get("metric_std", {}).items()}
+    params = {
+        "cv_folds": cv.get("folds"),
+        "cv_repeats": cv.get("repeats"),
+        "cv_fits": cv.get("total_fits_per_candidate"),
+        "cv_fold_fingerprint": cv.get("fold_fingerprint"),
+    }
+    return std, list(cv.get("fold_metrics", [])), params
+
+
 class _Tracker:
     def __init__(self, config: MLToolConfig) -> None:
         logging.getLogger("mlflow").setLevel(logging.ERROR)
@@ -61,15 +76,24 @@ class _Tracker:
         metrics: dict[str, float],
         tags: dict[str, Any],
         failed: bool = False,
+        fold_metrics: list[dict[str, Any]] | None = None,
     ) -> str:
         from mlflow.entities import Metric, Param, RunTag
 
         run = self.client.create_run(self.experiment_id, run_name=run_name)
         run_id = run.info.run_id
         now = int(time.time() * 1000)
+        series = [Metric(key, float(value), now, 0) for key, value in metrics.items()]
+        # Per-fold values share the mean's metric name, stepped by fold index, so
+        # MLflow plots them as a series under the aggregate.
+        for step, entry in enumerate(fold_metrics or []):
+            series.extend(
+                Metric(f"fold_{key}", float(value), now, step)
+                for key, value in entry["metrics"].items()
+            )
         self.client.log_batch(
             run_id,
-            metrics=[Metric(key, float(value), now, 0) for key, value in metrics.items()],
+            metrics=series,
             params=[Param(key, _param(value)) for key, value in params.items()],
             tags=[RunTag(key, _param(value)) for key, value in tags.items()],
         )
@@ -103,6 +127,9 @@ def log_training(config: MLToolConfig, result_set: Any):
             metrics = dict(result.get("metrics", {}))
             if "training_seconds" in result:
                 metrics["training_seconds"] = result["training_seconds"]
+            cv_std, cv_folds, cv_params = _cv_metrics(result)
+            metrics.update(cv_std)
+            params.update(cv_params)
             tags = {
                 "phase": "train",
                 "candidate_id": result["candidate_id"],
@@ -117,6 +144,7 @@ def log_training(config: MLToolConfig, result_set: Any):
                     metrics=metrics,
                     tags=tags,
                     failed=failed,
+                    fold_metrics=cv_folds,
                 )
             )
         return run_ids
@@ -147,6 +175,11 @@ def log_tuning(config: MLToolConfig, result_set: Any):
             metrics = dict(result.get("metrics", {}))
             if "phase4_primary_score" in result:
                 metrics["phase4_primary_score"] = result["phase4_primary_score"]
+            cv_std, cv_folds, cv_params = _cv_metrics(result)
+            metrics.update(cv_std)
+            params.update(cv_params)
+            for name, value in (result.get("holdout_metrics") or {}).items():
+                metrics[f"holdout_{name}"] = value
             tags = {
                 "phase": "tune",
                 "candidate_id": result["candidate_id"],
@@ -162,6 +195,7 @@ def log_tuning(config: MLToolConfig, result_set: Any):
                     metrics=metrics,
                     tags=tags,
                     failed=failed,
+                    fold_metrics=cv_folds,
                 )
             )
         return run_ids

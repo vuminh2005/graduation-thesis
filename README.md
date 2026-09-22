@@ -158,6 +158,78 @@ Output goes to `.mltool/tuning/` (`candidates/`, `leaderboard.json/csv`,
 `manifest.json`, and `selected.json`, the best tuned configuration for a later
 final refit). `tuning-leaderboard` is read-only.
 
+**Cross-validated evaluation.** A single validation holdout is small: on the
+891-row Titanic set it is 134 rows, and differences between FeatureSets on it
+are mostly noise. Adding an optional `evaluation.cv` section scores every
+candidate on folds of the development set (the train + validation rows) instead,
+and ranks the leaderboards by the mean:
+
+```yaml
+evaluation:
+  primary_metric: roc_auc
+  cv:
+    folds: 5      # integer >= 2
+    repeats: 1    # integer >= 1; each repeat re-partitions with its own
+                  # seed derived from split.random_seed
+```
+
+Absent, everything behaves exactly as before. With it:
+
+- Folds are stratified for classification and plain K-fold for regression; the
+  fold assignment is deterministic for a given `split.random_seed` and its
+  fingerprint is recorded in the manifest.
+- **Every fold refits everything.** The external preprocessor and the
+  FeatureSet's plugins are fitted on that fold's training rows only and then
+  applied to the held-out rows, through the same helpers `finalize` uses. The
+  materialized `.mltool/features/` artifacts are deliberately not used for
+  scoring, because their plugins saw the whole train split.
+- The test rows are never part of the development set, so `train` and `tune`
+  still record `test_data_used: false`.
+- `train` ranks by the CV mean and shows `mean +/- std (n folds)`; per-fold
+  metrics are persisted in each candidate's `result.json`. Fold predictors are
+  scratch and are not persisted (nothing downstream loads a training predictor),
+  so a cross-validated `result.json` has `predictor_path: null` and
+  `predictor_persisted: false`.
+- `tune` selects `top_n` by CV mean, runs HPO exactly as before (an AutoGluon
+  search on the train split), then re-scores the winning configuration across
+  the same folds with its hyperparameters **fixed**; that CV mean is what the
+  tuned leaderboard and `selected.json` report. Families HPO does not tune
+  (RF, XT, ENSEMBLE) are cross-validated as configured. Note the mild optimism
+  this leaves: the hyperparameters were searched on rows that also appear in the
+  CV training folds, so a tuned CV mean is not a fully unbiased estimate. Nested
+  cross-validation is out of scope.
+- `finalize` is unchanged: it refits the selected configuration on
+  train+validation and evaluates the test split once.
+- Changing `evaluation.cv` is part of the config signature, so it makes training
+  and tuning artifacts stale.
+- MLflow records the CV mean, a `<metric>_std`, and each fold's value as a
+  `fold_<metric>` series stepped by fold index.
+- Folds run sequentially to bound memory. `train` and `tune` print the total
+  number of fits up front and one progress line per fold, both on stderr.
+
+**Replacing a column with a plugin output.** A feature plugin only ever adds
+columns, so a plugin that reads `Age` to build `Age_group` would normally force
+`Age` to stay in the FeatureSet. `plugin_inputs` lists columns the plugins may
+read that are not features themselves:
+
+```yaml
+features:
+  sets:
+    - name: replaced
+      source_columns: [Pclass, Sex, Fare, Embarked]
+      plugin_inputs: [Age, SibSp, Parch]
+      plugins: [age_group, family_count]
+```
+
+The plugins see `source_columns` plus `plugin_inputs`; the FeatureSet's final
+columns are `source_columns` plus the plugin outputs, so here `Age_group` and
+`family_count` genuinely replace `Age`, `SibSp` and `Parch`. The columns must
+exist after preprocessing, must not be the target, must be unique, and a plugin
+may not emit a name that collides with a source column or a plugin input.
+`plugin_inputs` is part of the FeatureSet recipe, so changing it makes the
+feature artifacts stale, and it is honored identically by `features`,
+`finalize`'s refit and each cross-validation fold.
+
 Two different holdouts are involved. Inside each candidate, AutoGluon picks the
 winning trial on its own internal holdout carved from the train split.
 Cross-candidate ranking (`top_n` selection and the tuning leaderboard) uses

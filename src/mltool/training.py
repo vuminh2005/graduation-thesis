@@ -33,6 +33,7 @@ class TrainingResult:
     direction: str
     candidate_results: list[dict[str, Any]]
     leaderboard: list[dict[str, Any]]
+    cv: dict[str, Any] | None = None
 
     @property
     def successful_count(self) -> int:
@@ -57,6 +58,7 @@ class TrainingResult:
             "Candidates",
             f"  {len(self.candidate_results)}",
         ]
+        lines.extend(_cv_header(self.cv))
         total = len(self.candidate_results)
         for index, result in enumerate(self.candidate_results, start=1):
             lines.extend(
@@ -68,17 +70,24 @@ class TrainingResult:
                 ]
             )
             if result["status"] == "SUCCEEDED":
+                cv = result.get("cv")
+                std = cv["metric_std"] if cv else None
+                folds = cv["total_fits_per_candidate"] if cv else None
                 for metric, value in result["metrics"].items():
-                    lines.append(f"      {metric}={value:.6f}")
+                    lines.append(
+                        f"      {metric}="
+                        f"{format_score(value, std[metric] if std else None, folds)}"
+                    )
                 lines.append(f"      time={result['training_seconds']:.2f}s")
             else:
                 lines.append(f"      error: {result['error_message']}")
         lines.extend(["", "Global leaderboard"])
         succeeded = [row for row in self.leaderboard if row["status"] == "SUCCEEDED"]
         for row in succeeded:
+            score = format_score(row["primary_score"], *_row_score_parts(row))
             lines.append(
                 f"  {row['rank']}. {row['feature_set']} x {row['model']}   "
-                f"{self.primary_metric}={row['primary_score']:.6f}"
+                f"{self.primary_metric}={score}"
             )
         if self.failed_count:
             lines.extend(["", f"Warnings", f"  ! {self.failed_count} candidate(s) failed"])
@@ -106,13 +115,13 @@ class PersistedLeaderboard:
             "MLTool global leaderboard",
             "",
             f"Primary metric: {metric} ({self.manifest['metric_direction']})",
-            "",
-            "Rank  FeatureSet  Model  Family  Score  Time  Status",
         ]
+        lines.extend(_cv_header(self.manifest.get("cv")))
+        lines.extend(["", "Rank  FeatureSet  Model  Family  Score  Time  Status"])
         for row in self.rows:
             rank = str(row["rank"]) if row["rank"] is not None else "-"
             score = (
-                f"{row['primary_score']:.6f}"
+                format_score(row["primary_score"], *_row_score_parts(row))
                 if row.get("primary_score") is not None
                 else "-"
             )
@@ -129,6 +138,31 @@ class PersistedLeaderboard:
             lines.extend(["", "Warnings", f"  ! {self.warning}"])
         lines.extend(["", "Test split: NOT USED"])
         return "\n".join(lines)
+
+
+def format_score(value: float, std: float | None, folds: int | None) -> str:
+    """``0.912345`` for a holdout score, ``0.912345 +/- 0.021 (15 folds)`` for a CV mean."""
+    if std is None or folds is None:
+        return f"{value:.6f}"
+    return f"{value:.6f} +/- {std:.6f} ({folds} folds)"
+
+
+def _row_score_parts(row: dict[str, Any]) -> tuple[float | None, int | None]:
+    return row.get("primary_score_std"), row.get("folds")
+
+
+def _cv_header(cv: dict[str, Any] | None) -> list[str]:
+    if not cv:
+        return []
+    return [
+        "",
+        "Cross-validation",
+        f"  {cv['folds']} folds x {cv['repeats']} repeat(s) = "
+        f"{cv['total_fits_per_candidate']} fits per candidate"
+        f"{' (stratified)' if cv.get('stratified') else ''}",
+        f"  development rows: {cv['development_rows']}  |  test rows: not used",
+        f"  fold fingerprint: {cv['fold_fingerprint'][:16]}",
+    ]
 
 
 def _autogluon_version() -> str:
@@ -194,6 +228,60 @@ def _candidate_failure(
         },
         "status": "FAILED",
         "error_message": message,
+    }
+
+
+def _cv_train_candidate(
+    plan: ExperimentPlan,
+    candidate: CandidateSpec,
+    cv_plan: Any,
+    *,
+    adapter_factory: Callable[[], AutoGluonAdapter],
+) -> dict[str, Any]:
+    """Cross-validated scoring of one candidate; every fold refits all state."""
+    from mltool.cross_validation import cv_score_candidate
+
+    config = plan.config
+    started = time.perf_counter()
+    spec = next(s for s in config.features.sets if s.name == candidate.feature_set.name)
+    catalog = {plugin.name: plugin for plugin in config.features.plugins}
+    score = cv_score_candidate(
+        config,
+        cv_plan,
+        spec,
+        candidate.model,
+        catalog,
+        adapter_factory=adapter_factory,
+        label=candidate.candidate_id,
+    )
+    return {
+        "candidate_id": candidate.candidate_id,
+        "feature_set": candidate.feature_set.name,
+        "feature_artifacts": {
+            "train_sha256": candidate.feature_set.train_sha256,
+            "validation_sha256": candidate.feature_set.validation_sha256,
+        },
+        "model": {
+            "name": candidate.model.name,
+            "family": candidate.model.family,
+            "params": candidate.model.params,
+        },
+        "task": config.task.type,
+        "primary_metric": config.evaluation.primary_metric,
+        "metrics": score.metrics,
+        "cv": score.as_record(cv_plan),
+        "seed": config.training.seed,
+        "effective_seed": effective_model_seed(candidate.model, config.training),
+        "positive_class": score.positive_class,
+        "target_conversion_applied": score.target_conversion_applied,
+        "training_seconds": float(time.perf_counter() - started),
+        # Each fold has its own model, and nothing downstream loads a training
+        # predictor, so fold predictors are scratch and never persisted.
+        "predictor_path": None,
+        "predictor_persisted": False,
+        "autogluon_version": score.autogluon_version,
+        "trained_models": score.trained_models,
+        "status": "SUCCEEDED",
     }
 
 
@@ -278,6 +366,10 @@ def build_leaderboard(
             "training_seconds": result["training_seconds"],
             "status": "SUCCEEDED",
         }
+        cv = result.get("cv")
+        if cv:
+            row["primary_score_std"] = cv["metric_std"][primary_metric]
+            row["folds"] = cv["total_fits_per_candidate"]
         row.update(result["metrics"])
         rows.append(row)
     for result in failures:
@@ -328,6 +420,16 @@ def train_experiment(
         raise TrainingError(f"could not create training workspace: {exc}") from exc
 
     adapter_factory = adapter_factory or AutoGluonAdapter
+    cv_plan = None
+    if plan.config.evaluation.cv is not None:
+        from mltool.cross_validation import build_cv_plan, cost_warning, progress
+
+        try:
+            cv_plan = build_cv_plan(plan.config)
+        except Exception as exc:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise TrainingError(str(exc)) from exc
+        progress(cost_warning(len(plan.candidates), cv_plan, "train"))
     candidate_results: list[dict[str, Any]] = []
     try:
         for candidate in plan.candidates:
@@ -335,13 +437,18 @@ def train_experiment(
             final_candidate = output_path / "candidates" / candidate.candidate_id
             staging_candidate.mkdir()
             try:
-                result = _train_candidate(
-                    plan,
-                    candidate,
-                    staging_candidate_path=staging_candidate,
-                    final_candidate_path=final_candidate,
-                    adapter=adapter_factory(),
-                )
+                if cv_plan is not None:
+                    result = _cv_train_candidate(
+                        plan, candidate, cv_plan, adapter_factory=adapter_factory
+                    )
+                else:
+                    result = _train_candidate(
+                        plan,
+                        candidate,
+                        staging_candidate_path=staging_candidate,
+                        final_candidate_path=final_candidate,
+                        adapter=adapter_factory(),
+                    )
             except (TrainingError, AutoGluonError, EvaluationError) as exc:
                 # Candidate-specific failures are data/model failures, not matrix
                 # failures. Continue sequentially and persist a concise result.
@@ -397,6 +504,7 @@ def train_experiment(
                 for model in plan.config.models
             ],
             "candidate_ids": [candidate.candidate_id for candidate in plan.candidates],
+            **({"cv": cv_plan.summary()} if cv_plan is not None else {}),
             "seed": plan.config.training.seed,
             "effective_seed": {
                 candidate.candidate_id: effective_model_seed(
@@ -431,7 +539,14 @@ def train_experiment(
         direction=plan.config.evaluation.direction,
         candidate_results=candidate_results,
         leaderboard=leaderboard,
+        cv=cv_plan.summary() if cv_plan is not None else None,
     )
+
+
+def cv_signature(config: MLToolConfig) -> dict[str, int] | None:
+    """The cross-validation settings as they appear in a config signature."""
+    cv = config.evaluation.cv
+    return None if cv is None else {"folds": cv.folds, "repeats": cv.repeats}
 
 
 def _config_signature(config: MLToolConfig) -> dict[str, Any]:
@@ -440,12 +555,21 @@ def _config_signature(config: MLToolConfig) -> dict[str, Any]:
         "target": config.task.target,
         "primary_metric": config.evaluation.primary_metric,
         "secondary_metrics": config.evaluation.secondary_metrics,
+        "cv": cv_signature(config),
         "feature_sets": [feature_set.name for feature_set in config.features.sets],
         "models": [
             {"name": model.name, "family": model.family, "params": model.params}
             for model in config.models
         ],
     }
+
+
+def _manifest_cv_signature(manifest: dict[str, Any]) -> dict[str, int] | None:
+    """A manifest written before Phase 9 has no cv block, which means holdout."""
+    cv = manifest.get("cv")
+    if not isinstance(cv, dict):
+        return None
+    return {"folds": cv["folds"], "repeats": cv["repeats"]}
 
 
 def load_persisted_leaderboard(config: MLToolConfig) -> PersistedLeaderboard:
@@ -466,6 +590,7 @@ def load_persisted_leaderboard(config: MLToolConfig) -> PersistedLeaderboard:
         "target": manifest.get("target"),
         "primary_metric": manifest.get("primary_metric"),
         "secondary_metrics": manifest.get("secondary_metrics"),
+        "cv": _manifest_cv_signature(manifest),
         "feature_sets": [
             entry.get("name") for entry in manifest.get("feature_sets", [])
             if isinstance(entry, dict)

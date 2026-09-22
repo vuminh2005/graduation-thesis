@@ -183,6 +183,10 @@ def _validate_recipe(
     source_columns = manifest.get("source_columns")
     if source_columns != _expected_source_columns(spec, prepared_feature_columns):
         raise _stale(f'feature set "{spec.name}" source columns changed')
+    # Missing key: materialized before plugin_inputs existed, which is only
+    # equivalent to a set that does not configure any.
+    if manifest.get("plugin_inputs", []) != list(spec.plugin_inputs):
+        raise _stale(f'feature set "{spec.name}" plugin inputs changed')
 
     catalog = {plugin.name: plugin for plugin in config.features.plugins}
     plugins = manifest.get("plugins")

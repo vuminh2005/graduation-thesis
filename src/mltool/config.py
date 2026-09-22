@@ -105,6 +105,9 @@ class FeatureSetConfig:
     name: str
     source_columns: list[str]
     plugins: list[str]
+    # Columns the plugins may read but that are not features themselves, so a
+    # plugin can replace a column instead of only adding to it (Phase 9).
+    plugin_inputs: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -121,9 +124,22 @@ class ModelConfig:
 
 
 @dataclass(frozen=True)
+class CvConfig:
+    """Cross-validated candidate evaluation (Phase 9); absent means single holdout."""
+
+    folds: int
+    repeats: int
+
+    @property
+    def total_fits(self) -> int:
+        return self.folds * self.repeats
+
+
+@dataclass(frozen=True)
 class EvaluationConfig:
     primary_metric: str
     secondary_metrics: list[str]
+    cv: CvConfig | None = None
 
     @property
     def metrics(self) -> list[str]:
@@ -303,7 +319,7 @@ def _evaluation_config(raw: dict[str, Any], task_type: str) -> EvaluationConfig:
     evaluation_raw = raw.get("evaluation", {})
     if not isinstance(evaluation_raw, dict):
         raise ConfigError('configuration section "evaluation" must be a mapping')
-    _reject_unknown(evaluation_raw, {"primary_metric", "secondary_metrics"}, "evaluation")
+    _reject_unknown(evaluation_raw, {"primary_metric", "secondary_metrics", "cv"}, "evaluation")
     primary = evaluation_raw.get("primary_metric", default_primary)
     if not isinstance(primary, str) or not primary.strip():
         raise ConfigError('"evaluation.primary_metric" must be a non-empty string')
@@ -330,7 +346,26 @@ def _evaluation_config(raw: dict[str, Any], task_type: str) -> EvaluationConfig:
                 f'metric "{metric}" is not supported for task "{task_type}"; '
                 f"expected one of: {supported}"
             )
-    return EvaluationConfig(primary_metric=primary, secondary_metrics=secondary)
+    return EvaluationConfig(
+        primary_metric=primary, secondary_metrics=secondary, cv=_cv_config(evaluation_raw)
+    )
+
+
+def _cv_config(evaluation_raw: dict[str, Any]) -> CvConfig | None:
+    """``evaluation.cv``; absent (or null) keeps the single-holdout behavior."""
+    if "cv" not in evaluation_raw or evaluation_raw["cv"] is None:
+        return None
+    cv_raw = evaluation_raw["cv"]
+    if not isinstance(cv_raw, dict):
+        raise ConfigError('configuration section "evaluation.cv" must be a mapping')
+    _reject_unknown(cv_raw, {"folds", "repeats"}, "evaluation.cv")
+    folds = cv_raw.get("folds", 5)
+    if isinstance(folds, bool) or not isinstance(folds, int) or folds < 2:
+        raise ConfigError('"evaluation.cv.folds" must be an integer of at least 2')
+    repeats = cv_raw.get("repeats", 1)
+    if isinstance(repeats, bool) or not isinstance(repeats, int) or repeats < 1:
+        raise ConfigError('"evaluation.cv.repeats" must be an integer of at least 1')
+    return CvConfig(folds=folds, repeats=repeats)
 
 
 def _training_config(raw: dict[str, Any]) -> TrainingConfig:
@@ -433,7 +468,9 @@ def _feature_config(raw: dict[str, Any]) -> FeaturesConfig:
         prefix = f"features.sets[{index}]"
         if not isinstance(set_raw, dict):
             raise ConfigError(f'"{prefix}" must be a mapping')
-        _reject_unknown(set_raw, {"name", "source_columns", "plugins"}, prefix)
+        _reject_unknown(
+            set_raw, {"name", "source_columns", "plugins", "plugin_inputs"}, prefix
+        )
         name = _non_empty_string(set_raw, "name", f"{prefix}.name")
         if not SAFE_FEATURE_SET_NAME.fullmatch(name):
             raise ConfigError(
@@ -472,11 +509,28 @@ def _feature_config(raw: dict[str, Any]) -> FeaturesConfig:
             raise ConfigError(
                 f'feature set "{name}" references unknown plugin "{unknown[0]}"'
             )
+        plugin_inputs = set_raw.get("plugin_inputs", [])
+        if not isinstance(plugin_inputs, list) or not all(
+            isinstance(column, str) and column for column in plugin_inputs
+        ):
+            raise ConfigError(f'"{prefix}.plugin_inputs" must be a list of non-empty strings')
+        if len(plugin_inputs) != len(set(plugin_inputs)):
+            raise ConfigError(f'"{prefix}.plugin_inputs" must contain unique values')
+        if "*" in plugin_inputs:
+            raise ConfigError(
+                f'"{prefix}.plugin_inputs" may not contain "*"; list the columns explicitly'
+            )
+        if plugin_inputs and not referenced_plugins:
+            raise ConfigError(
+                f'"{prefix}.plugin_inputs" requires at least one plugin in '
+                f'"{prefix}.plugins"; the columns would otherwise be read by nothing'
+            )
         feature_sets.append(
             FeatureSetConfig(
                 name=name,
                 source_columns=list(source_columns),
                 plugins=list(referenced_plugins),
+                plugin_inputs=list(plugin_inputs),
             )
         )
     return FeaturesConfig(plugins=plugins, sets=feature_sets)

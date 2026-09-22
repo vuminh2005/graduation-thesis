@@ -277,6 +277,32 @@ def _selected_source_columns(
     return list(spec.source_columns)
 
 
+def _selected_plugin_inputs(
+    spec: FeatureSetConfig,
+    available: list[str],
+    target: str,
+    source_columns: list[str],
+) -> list[str]:
+    """Columns the plugins may read that are not features themselves (Phase 9).
+
+    Returned in config order, with anything already in ``source_columns``
+    dropped: those are visible to plugins anyway.
+    """
+    if not spec.plugin_inputs:
+        return []
+    if target in spec.plugin_inputs:
+        raise FeatureMaterializationError(
+            f'feature set "{spec.name}" may not use configured target column '
+            f'"{target}" as a plugin input'
+        )
+    missing = [column for column in spec.plugin_inputs if column not in available]
+    if missing:
+        raise FeatureMaterializationError(
+            f'feature set "{spec.name}" requests missing plugin input "{missing[0]}"'
+        )
+    return [column for column in spec.plugin_inputs if column not in source_columns]
+
+
 def _plugin_manifest(
     spec: FeaturePluginConfig,
     generated_columns: list[str],
@@ -320,15 +346,22 @@ def build_feature_set_from_frames(
     """
     target = config.task.target
     split_names = list(prepared_frames)
-    source_columns = _selected_source_columns(
-        spec, prepared_frames[fit_split].columns.tolist(), target
-    )
+    available = prepared_frames[fit_split].columns.tolist()
+    source_columns = _selected_source_columns(spec, available, target)
+    # Extra columns the plugins read but that never become features, so a plugin
+    # can replace a column rather than only add to it.
+    extra_plugin_inputs = _selected_plugin_inputs(spec, available, target, source_columns)
+    plugin_view_columns = [*source_columns, *extra_plugin_inputs]
     base_frames = {
         split_name: frame.loc[:, source_columns].copy(deep=True)
         for split_name, frame in prepared_frames.items()
     }
+    plugin_frames = {
+        split_name: frame.loc[:, plugin_view_columns].copy(deep=True)
+        for split_name, frame in prepared_frames.items()
+    }
     generated_by_split: dict[str, list[pd.DataFrame]] = {name: [] for name in split_names}
-    occupied_columns = set(source_columns)
+    occupied_columns = set(plugin_view_columns)
     plugin_manifests: list[dict[str, Any]] = []
     fitted_plugins: dict[str, Any] = {}
     lineage: dict[str, dict[str, str]] = {
@@ -342,7 +375,7 @@ def build_feature_set_from_frames(
             config_path=config.config_path,
             target=target,
             fit_split=fit_split,
-            base_frames=base_frames,
+            base_frames=plugin_frames,
         )
         collisions = [
             column for column in generated_columns if column in occupied_columns
@@ -390,6 +423,7 @@ def build_feature_set_from_frames(
     manifest = {
         "name": spec.name,
         "source_columns": source_columns,
+        "plugin_inputs": list(spec.plugin_inputs),
         "plugins": plugin_manifests,
         "final_feature_columns": final_feature_columns,
         "target": target,
