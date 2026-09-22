@@ -18,7 +18,13 @@ from mltool.config import MLToolConfig
 from mltool.data import DataLoadError, load_dataset
 from mltool.feature_plugins import FeaturePluginError
 from mltool.evaluation import EvaluationError, evaluate_predictions
-from mltool.experiment import ExperimentError, ExperimentPlan, sha256_file
+from mltool.experiment import (
+    ExperimentError,
+    ExperimentPlan,
+    current_feature_set_recipe,
+    recipe_fingerprint,
+    sha256_file,
+)
 from mltool.feature_materialization import (
     FeatureMaterializationError,
     _fingerprint,
@@ -521,6 +527,9 @@ def finalize_experiment(
                 "fingerprint"
             ],
             "feature_artifacts": selected["feature_artifacts"],
+            "selected_feature_set_recipe": recipe_fingerprint(
+                current_feature_set_recipe(config, candidate.feature_set.name)
+            ),
             "prepared_artifacts_fingerprint": prepared_artifacts_fingerprint(
                 project_root / ".mltool/prepared"
             ),
@@ -588,6 +597,20 @@ def _upstream_staleness(config: MLToolConfig, manifest: dict[str, Any]) -> str |
             return str(exc)
     if current != recorded_features:
         return "the selected FeatureSet was re-materialized after this final model was created"
+
+    # The parquet bytes above only prove features/ was not rebuilt. A recipe
+    # edit that has not been re-materialized yet leaves them untouched.
+    recorded_recipe = manifest.get("selected_feature_set_recipe")
+    if not isinstance(recorded_recipe, str) or not recorded_recipe:
+        return "this final model predates feature-set recipe fingerprinting"
+    try:
+        current_recipe = recipe_fingerprint(
+            current_feature_set_recipe(config, selected["feature_set"])
+        )
+    except ExperimentError as exc:
+        return str(exc)
+    if current_recipe != recorded_recipe:
+        return "the selected feature set's recipe changed after this final model was created"
     return None
 
 

@@ -172,38 +172,88 @@ def _expected_source_columns(
     return list(spec.source_columns)
 
 
+def feature_set_recipe(
+    config: MLToolConfig,
+    spec: FeatureSetConfig,
+    prepared_feature_columns: list[str],
+) -> dict[str, Any]:
+    """Everything about a FeatureSet that decides which columns it materializes.
+
+    The single definition of a "recipe": ``_validate_recipe`` checks a
+    materialized manifest against it, and ``finalize`` fingerprints it so a
+    later recipe change can be detected without re-reading ``features/``.
+    """
+    catalog = {plugin.name: plugin for plugin in config.features.plugins}
+    return {
+        "name": spec.name,
+        "target": config.task.target,
+        "source_columns": _expected_source_columns(spec, prepared_feature_columns),
+        "plugin_inputs": list(spec.plugin_inputs),
+        "plugins": [
+            {
+                "name": name,
+                "entrypoint": catalog[name].entrypoint,
+                "params": catalog[name].params,
+            }
+            for name in spec.plugins
+        ],
+    }
+
+
+def recipe_fingerprint(recipe: dict[str, Any]) -> str:
+    payload = json.dumps(recipe, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def current_feature_set_recipe(config: MLToolConfig, name: str) -> dict[str, Any]:
+    """The configured recipe for one FeatureSet, with ``*`` source columns resolved."""
+    for spec in config.features.sets:
+        if spec.name == name:
+            break
+    else:
+        raise ExperimentError(f'feature set "{name}" is no longer configured')
+    global_manifest = _read_json(
+        config.config_path.parent / ".mltool/features/manifest.json",
+        "global feature manifest",
+    )
+    prepared_feature_columns = global_manifest.get("prepared_feature_columns")
+    if not isinstance(prepared_feature_columns, list) or not all(
+        isinstance(column, str) for column in prepared_feature_columns
+    ):
+        raise _stale("global feature manifest has no resolved prepared feature schema")
+    return feature_set_recipe(config, spec, list(prepared_feature_columns))
+
+
 def _validate_recipe(
     config: MLToolConfig,
     spec: FeatureSetConfig,
     manifest: dict[str, Any],
     prepared_feature_columns: list[str],
 ) -> list[str]:
-    if manifest.get("name") != spec.name or manifest.get("target") != config.task.target:
+    recipe = feature_set_recipe(config, spec, prepared_feature_columns)
+    if manifest.get("name") != recipe["name"] or manifest.get("target") != recipe["target"]:
         raise _stale(f'feature set "{spec.name}" name/target does not match config')
-    source_columns = manifest.get("source_columns")
-    if source_columns != _expected_source_columns(spec, prepared_feature_columns):
+    if manifest.get("source_columns") != recipe["source_columns"]:
         raise _stale(f'feature set "{spec.name}" source columns changed')
     # Missing key: materialized before plugin_inputs existed, which is only
     # equivalent to a set that does not configure any.
-    if manifest.get("plugin_inputs", []) != list(spec.plugin_inputs):
+    if manifest.get("plugin_inputs", []) != recipe["plugin_inputs"]:
         raise _stale(f'feature set "{spec.name}" plugin inputs changed')
 
-    catalog = {plugin.name: plugin for plugin in config.features.plugins}
     plugins = manifest.get("plugins")
     if not isinstance(plugins, list):
         raise _stale(f'feature set "{spec.name}" plugin metadata is invalid')
     if [plugin.get("name") for plugin in plugins if isinstance(plugin, dict)] != spec.plugins:
         raise _stale(f'feature set "{spec.name}" plugin sequence changed')
-    for plugin_entry, plugin_name in zip(plugins, spec.plugins, strict=True):
+    for plugin_entry, expected in zip(plugins, recipe["plugins"], strict=True):
         if not isinstance(plugin_entry, dict):
             raise _stale(f'feature set "{spec.name}" plugin metadata is invalid')
-        current = catalog[plugin_name]
         if (
-            plugin_entry.get("entrypoint") != current.entrypoint
-            or plugin_entry.get("params") != current.params
+            plugin_entry.get("entrypoint") != expected["entrypoint"]
+            or plugin_entry.get("params") != expected["params"]
         ):
             raise _stale(
-                f'feature set "{spec.name}" plugin "{plugin_name}" configuration changed'
+                f'feature set "{spec.name}" plugin "{expected["name"]}" configuration changed'
             )
 
     final_columns = manifest.get("final_feature_columns")

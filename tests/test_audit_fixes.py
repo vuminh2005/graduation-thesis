@@ -28,7 +28,13 @@ from mltool.cli import (
     tune_project,
 )
 from mltool.config import load_config
-from mltool.experiment import ExperimentError, build_experiment_plan, load_feature_artifacts
+from mltool.experiment import (
+    ExperimentError,
+    build_experiment_plan,
+    current_feature_set_recipe,
+    load_feature_artifacts,
+    recipe_fingerprint,
+)
 from mltool.feature_materialization import (
     FeatureMaterializationError,
     prepared_artifacts_fingerprint,
@@ -409,3 +415,183 @@ def test_mlflow_trace_file_is_absent_when_tracking_fails(
     assert not (tmp_path / ".mltool/tuning/mlflow.json").exists()
     assert not (tmp_path / ".mltool/final/mlflow.json").exists()
     assert register_project(path) == 0  # registering still works without it
+
+
+# ====== Phase-9 audit follow-up: the selected FeatureSet's recipe ================
+#
+# The parquet hashes above only prove features/ was not rebuilt. A recipe edit
+# that has not been re-materialized leaves those bytes untouched, so register
+# used to accept a final model built from a recipe the config no longer asks for.
+
+RECIPE_PLUGINS = '''
+import pandas as pd
+
+
+class Scaled:
+    def __init__(self, factor=2):
+        self.factor = factor
+
+    def fit(self, X):
+        return self
+
+    def transform(self, X):
+        return pd.DataFrame({"x_scaled": X["x"] * self.factor}, index=X.index)
+
+
+class Shifted:
+    def fit(self, X):
+        return self
+
+    def transform(self, X):
+        return pd.DataFrame({"x_shift": X["x"] + 1}, index=X.index)
+'''
+
+
+def recipe_set(name: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "source_columns": ["x"],
+        "plugins": ["scaled"],
+        "plugin_inputs": ["z"],
+    }
+
+
+def recipe_build(root: Path) -> Path:
+    """A finalized project with two interchangeable plugin-bearing FeatureSets."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "plugin.py").write_text(RECIPE_PLUGINS, encoding="utf-8")
+    frame = pd.DataFrame(
+        {
+            "x": range(100),
+            "z": [value % 7 for value in range(100)],
+            "w": [value % 3 for value in range(100)],
+            "label": [value % 2 for value in range(100)],
+        }
+    )
+    raw = project_config(
+        models=GBM_AND_RF,
+        training={"seed": 7},
+        features={
+            "plugins": [
+                {"name": "scaled", "entrypoint": "./plugin.py:Scaled", "params": {"factor": 2}},
+                {"name": "shifted", "entrypoint": "./plugin.py:Shifted", "params": {}},
+            ],
+            "sets": [recipe_set("one"), recipe_set("two")],
+        },
+    )
+    path = materialize(root, raw=raw, frame=frame)
+    hpo_raw(path, top_n=2)
+    for step in (plan_project, train_project, tune_project, finalize_project):
+        assert step(path) == 0, step
+    return path
+
+
+def selected_set(root: Path) -> str:
+    return json.loads((root / ".mltool/final/manifest.json").read_text())["selected"]["feature_set"]
+
+
+def _drop_plugin(spec: dict[str, Any]) -> None:
+    # plugin_inputs without a plugin to read them is rejected by the config.
+    spec["plugins"] = []
+    spec["plugin_inputs"] = []
+
+
+RECIPE_EDITS = {
+    "source_columns": lambda s: s.__setitem__("source_columns", ["x", "w"]),
+    "plugin_added": lambda s: s.__setitem__("plugins", ["scaled", "shifted"]),
+    "plugin_removed": _drop_plugin,
+    "plugin_inputs": lambda s: s.__setitem__("plugin_inputs", ["z", "w"]),
+}
+
+
+def edit_set(path: Path, name: str, dimension: str) -> None:
+    def mutate(raw: dict[str, Any]) -> None:
+        if dimension == "plugin_params":
+            catalog = {plugin["name"]: plugin for plugin in raw["features"]["plugins"]}
+            catalog["scaled"]["params"] = {"factor": 3}
+            return
+        for spec in raw["features"]["sets"]:
+            if spec["name"] == name:
+                RECIPE_EDITS[dimension](spec)
+
+    edit(path, mutate)
+
+
+SET_DIMENSIONS = ["source_columns", "plugin_added", "plugin_removed", "plugin_inputs"]
+# The plugin catalog is shared, so its params are never one set's alone.
+RECIPE_DIMENSIONS = [*SET_DIMENSIONS, "plugin_params"]
+
+
+def test_final_manifest_records_the_selected_feature_set_recipe(tmp_path: Path) -> None:
+    path = recipe_build(tmp_path)
+    config = load_config(path)
+    manifest = json.loads((tmp_path / ".mltool/final/manifest.json").read_text())
+    assert manifest["selected_feature_set_recipe"] == recipe_fingerprint(
+        current_feature_set_recipe(config, selected_set(tmp_path))
+    )
+    assert load_persisted_final(config).warning is None
+
+
+@pytest.mark.parametrize("dimension", RECIPE_DIMENSIONS)
+def test_a_selected_recipe_change_makes_the_final_model_stale(
+    tmp_path: Path, dimension: str
+) -> None:
+    path = recipe_build(tmp_path / dimension)
+    edit_set(path, selected_set(path.parent), dimension)
+    warning = load_persisted_final(load_config(path)).warning
+    assert warning is not None and "recipe changed" in warning
+
+
+@pytest.mark.parametrize("dimension", RECIPE_DIMENSIONS)
+def test_a_selected_recipe_change_blocks_register_until_forced(
+    tmp_path: Path, dimension: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = recipe_build(tmp_path / dimension)
+    root = path.parent
+    edit_set(path, selected_set(root), dimension)
+    capsys.readouterr()
+
+    assert register_project(path) == 2
+    assert "the final artifacts are stale" in capsys.readouterr().out
+    assert list_versions(root) == []
+
+    assert final_result_project(path) == 0
+    assert "recipe changed" in capsys.readouterr().out
+    assert best_project(path) == 0
+    assert "recipe changed" in capsys.readouterr().out
+    from mltool.reporting import render_status
+
+    assert "stale" in [
+        line.split()[1] for line in render_status(load_config(path)).splitlines()
+        if line.startswith("finalize")
+    ]
+
+    assert register_project(path, force=True) == 0
+    assert list_versions(root) == [1]
+    metadata = json.loads((root / ".mltool/registry/1/metadata.json").read_text())
+    assert metadata["forced"] is True and "recipe changed" in metadata["warning"]
+
+
+@pytest.mark.parametrize("dimension", SET_DIMENSIONS)
+def test_a_recipe_change_to_another_feature_set_keeps_the_final_fresh(
+    tmp_path: Path, dimension: str
+) -> None:
+    path = recipe_build(tmp_path / dimension)
+    root = path.parent
+    others = [name for name in ("one", "two") if name != selected_set(root)]
+    edit_set(path, others[0], dimension)
+    assert load_persisted_final(load_config(path)).warning is None
+    assert register_project(path) == 0
+    metadata = json.loads((root / ".mltool/registry/1/metadata.json").read_text())
+    assert metadata["warning"] is None and metadata["forced"] is False
+
+
+def test_a_final_model_without_a_recipe_fingerprint_is_stale(tmp_path: Path) -> None:
+    path = recipe_build(tmp_path)
+    manifest_path = tmp_path / ".mltool/final/manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    del manifest["selected_feature_set_recipe"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert "predates feature-set recipe fingerprinting" in load_persisted_final(
+        load_config(path)
+    ).warning
