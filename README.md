@@ -91,6 +91,46 @@ computes configured metrics on the common validation split afterward. HPO,
 bagging, stacking, and AutoGluon's weighted ensemble are disabled so each
 candidate represents exactly one configured family.
 
+One `models[]` entry may use `family: ENSEMBLE` instead of a single family. It
+is still one candidate scored on the same validation split, competing in the
+same leaderboards and `top_n` selection as every other candidate; it is not a
+mode of `finalize`, and enabling ensembling only there would let a model reach
+the test set without ever being compared on validation, which MLTool does not
+allow. An ENSEMBLE candidate lets AutoGluon itself bag, stack, and
+weighted-ensemble several of the five families on the FeatureSet's train split
+(`num_gpus=0`, sequential fold fitting, `dynamic_stacking` off, and no
+`tuning_data`, exactly like every other candidate):
+
+```yaml
+models:
+  - name: ag_ensemble
+    family: ENSEMBLE
+    params:
+      families: [GBM, CAT, XGB, RF, XT]   # default: all five, this order; a
+                                          # non-empty unique subset (ENSEMBLE
+                                          # itself may not appear)
+      num_bag_folds: 3                    # default 3; 0 (no bagging) or >= 2
+      num_stack_levels: 1                 # default 1; >= 0; > 0 requires
+                                          # num_bag_folds >= 2
+```
+
+Each member family uses AutoGluon's own defaults plus `training.seed` on its
+own seed key; fixed per-family hyperparameters inside an ensemble are not
+supported. An ENSEMBLE candidate costs noticeably more time and memory than a
+single family, since it fits every member family (repeated across bag folds
+and stack levels) instead of one model — on the ~900-row real-data smoke test
+used to verify this it took roughly 6-10x as long as one single-family
+candidate, still under 9 GB of the machine's ~14 GB RAM. HPO is not applied to
+it: combining bagging/stacking with AutoGluon's hyperparameter search is out of
+scope, so if an ENSEMBLE candidate reaches `tune`'s `top_n`, it is refit with
+its configured ensemble settings and marked `hpo_effective: false`, the same
+`result.json`/`selected.json` convention RF and XT already use for "no search
+space". If it wins, `finalize` refits the whole ensemble on train+validation
+and, exactly like a single family, uses `refit_full` to collapse it into one
+`_FULL` predictor trained on every row before the one test evaluation; the
+registry, `final-result`/`best`, and the MLflow run all show `family: ENSEMBLE`
+and the ensemble config where a single family would show its hyperparameters.
+
 Training artifacts live under `.mltool/training/`, including one predictor and
 result per candidate plus JSON/CSV global leaderboards. `leaderboard` is
 read-only. Phases 4 and 5 never load or evaluate FeatureSet `test.parquet` files.

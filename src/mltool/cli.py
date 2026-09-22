@@ -158,6 +158,18 @@ models:
     family: RF
     params: {{}}
 
+  # An ENSEMBLE candidate lets AutoGluon bag/stack/weighted-ensemble several
+  # families as one more model option; it is scored on the same validation
+  # split and competes normally, it is not a special "finalize" mode. Left
+  # commented out: it costs noticeably more time and memory than a single
+  # family. Uncomment to enable, all params below are the defaults.
+  # - name: ag_ensemble
+  #   family: ENSEMBLE
+  #   params:
+  #     families: [GBM, CAT, XGB, RF, XT]
+  #     num_bag_folds: 3
+  #     num_stack_levels: 1
+
 evaluation:
   primary_metric: roc_auc
   secondary_metrics:

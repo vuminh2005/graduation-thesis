@@ -38,6 +38,27 @@ def no_search_space_warning(family: str) -> str:
     )
 
 
+def ensemble_hpo_not_applied_warning() -> str:
+    return (
+        "HPO is not applied to ENSEMBLE candidates; this candidate ran with its "
+        "configured ensemble settings"
+    )
+
+
+def hpo_not_applicable_warning(family: str) -> str | None:
+    """Why HPO does not tune this family, or ``None`` when it does.
+
+    Kept as one lookup so ``hpo_effective``/``hpo_warning`` stay uniform across
+    every reason a candidate isn't tuned: no AutoGluon search space (RF/XT) or,
+    for ENSEMBLE, tuning combined with bagging being out of scope by design.
+    """
+    if family in NO_SEARCH_SPACE_FAMILIES:
+        return no_search_space_warning(family)
+    if family == "ENSEMBLE":
+        return ensemble_hpo_not_applied_warning()
+    return None
+
+
 class TuningError(ValueError):
     """An expected Phase-5 setup, staleness, or artifact problem."""
 
@@ -290,6 +311,11 @@ def _tune_candidate(
     train, validation_features, validation_target, converted = _prepare_candidate_frames(
         plan, candidate
     )
+    hpo_warning = hpo_not_applicable_warning(candidate.model.family)
+    # RF/XT still receive hyperparameter_tune_kwargs (AutoGluon just has no search
+    # space to act on, matching Phase 5's original behavior). ENSEMBLE candidates
+    # never combine bagging/stacking with HPO, so they are forced to hpo=None
+    # rather than merely relying on AutoGluon to ignore the kwargs.
     output = adapter.fit_predict(
         train_data=train,
         validation_features=validation_features,
@@ -298,7 +324,7 @@ def _tune_candidate(
         primary_metric=plan.config.evaluation.primary_metric,
         predictor_path=staging_candidate_path / "predictor",
         training=plan.config.training,
-        hpo=plan.config.hpo,
+        hpo=None if candidate.model.family == "ENSEMBLE" else plan.config.hpo,
     )
     metrics = evaluate_predictions(
         task_type=plan.config.task.type,
@@ -335,12 +361,8 @@ def _tune_candidate(
         },
         "seed": plan.config.training.seed,
         "effective_seed": effective_model_seed(candidate.model, plan.config.training),
-        "hpo_effective": candidate.model.family not in NO_SEARCH_SPACE_FAMILIES,
-        "hpo_warning": (
-            no_search_space_warning(candidate.model.family)
-            if candidate.model.family in NO_SEARCH_SPACE_FAMILIES
-            else None
-        ),
+        "hpo_effective": hpo_warning is None,
+        "hpo_warning": hpo_warning,
         "best_model": output.best_model,
         "best_hyperparameters": output.best_hyperparameters,
         "predictor_path": str(final_candidate_path / "predictor"),

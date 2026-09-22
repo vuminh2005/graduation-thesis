@@ -52,12 +52,32 @@ NO_SEARCH_SPACE_FAMILIES = frozenset({"RF", "XT"})
 def effective_model_seed(model: ModelConfig, training: TrainingConfig) -> Any | None:
     """The seed the model's own hyperparameters receive in ``fit``.
 
-    A seed fixed in the model's ``params`` wins over ``training.seed``.
+    A seed fixed in the model's ``params`` wins over ``training.seed``. An
+    ENSEMBLE candidate has no single family seed key of its own: the same
+    ``training.seed`` value is applied to every member family's seed key
+    (Step 4), so it is also what "effective seed" means for the candidate as
+    a whole.
     """
+    if model.family == "ENSEMBLE":
+        return training.seed
     params = dict(model.params)
     if training.seed is not None:
         params.setdefault(FAMILY_SEED_KEYS[model.family], training.seed)
     return params.get(FAMILY_SEED_KEYS[model.family])
+
+
+def _ensemble_hyperparameters(
+    families: list[str], seed: int | None
+) -> dict[str, dict[str, Any]]:
+    """Per-member-family hyperparameters for an ENSEMBLE candidate.
+
+    Per-family fixed hyperparameters inside an ensemble are out of scope: each
+    member family uses AutoGluon's own defaults plus the shared seed.
+    """
+    return {
+        family: ({FAMILY_SEED_KEYS[family]: seed} if seed is not None else {})
+        for family in families
+    }
 
 
 class AutoGluonError(RuntimeError):
@@ -88,6 +108,26 @@ def _check_trained_models(trained_models: list[str], family: str) -> None:
         raise AutoGluonError(
             "AutoGluon unexpectedly trained models outside family "
             f'{family}: {", ".join(unrelated)}'
+        )
+
+
+def _check_ensemble_trained_models(trained_models: list[str], families: list[str]) -> None:
+    """The ENSEMBLE-candidate guard: only the configured member families (bagged,
+    stacked, or refit ``_FULL`` variants) and AutoGluon's own weighted ensemble
+    are allowed; a foreign family is still rejected.
+    """
+    if not trained_models:
+        raise AutoGluonError("AutoGluon did not train a usable model")
+    expected_tokens = [token for family in families for token in FAMILY_MODEL_TOKENS[family]]
+    unrelated = [
+        name
+        for name in trained_models
+        if "WeightedEnsemble" not in name and not any(token in name for token in expected_tokens)
+    ]
+    if unrelated:
+        raise AutoGluonError(
+            "AutoGluon unexpectedly trained models outside the configured ensemble "
+            f'families {sorted(families)}: {", ".join(unrelated)}'
         )
 
 
@@ -130,6 +170,7 @@ class AutoGluonAdapter:
         training: TrainingConfig,
         hpo: HpoConfig | None = None,
     ) -> AutoGluonOutput:
+        is_ensemble = model.family == "ENSEMBLE"
         predictor_kwargs: dict[str, Any] = {
             "label": task.target,
             "problem_type": task.type,
@@ -139,28 +180,38 @@ class AutoGluonAdapter:
         }
         if task.type == "binary" and task.positive_class is not None:
             predictor_kwargs["positive_class"] = task.positive_class
-        model_params = dict(model.params)
         if training.seed is not None:
             predictor_kwargs["learner_kwargs"] = {"random_state": training.seed}
-            # An explicitly fixed model seed in the config wins over training.seed.
-            model_params.setdefault(FAMILY_SEED_KEYS[model.family], training.seed)
-        assert model_params.get(FAMILY_SEED_KEYS[model.family]) == effective_model_seed(
-            model, training
-        )
+
+        if is_ensemble:
+            hyperparameters = _ensemble_hyperparameters(model.params["families"], training.seed)
+        else:
+            model_params = dict(model.params)
+            if training.seed is not None:
+                # An explicitly fixed model seed in the config wins over training.seed.
+                model_params.setdefault(FAMILY_SEED_KEYS[model.family], training.seed)
+            assert model_params.get(FAMILY_SEED_KEYS[model.family]) == effective_model_seed(
+                model, training
+            )
+            hyperparameters = {model.family: model_params}
 
         fit_kwargs: dict[str, Any] = {
             "train_data": train_data.copy(deep=True),
-            "hyperparameters": {model.family: model_params},
+            "hyperparameters": hyperparameters,
             "hyperparameter_tune_kwargs": None,
-            "fit_weighted_ensemble": False,
+            "fit_weighted_ensemble": is_ensemble,
             "fit_full_last_level_weighted_ensemble": False,
             "full_weighted_ensemble_additionally": False,
-            "num_bag_folds": 0,
-            "num_stack_levels": 0,
+            "num_bag_folds": model.params["num_bag_folds"] if is_ensemble else 0,
+            "num_stack_levels": model.params["num_stack_levels"] if is_ensemble else 0,
             "dynamic_stacking": False,
             "num_gpus": 0,
             "fit_strategy": "sequential",
         }
+        if is_ensemble:
+            # Memory safety: never let AutoGluon auto-pick parallel (Ray-based) fold
+            # fitting, which can multiply peak RAM by the fold-parallelism factor.
+            fit_kwargs["ag_args_ensemble"] = {"fold_fitting_strategy": "sequential_local"}
         if hpo is not None:
             # Phase 5: local, sequential random search bounded by trials and time.
             # Everything else (no bagging/stacking/ensemble/GPU) is unchanged.
@@ -187,7 +238,13 @@ class AutoGluonAdapter:
                 )
             trained_models = list(predictor.model_names())
             best_model = best_hyperparameters = None
-            if hpo is not None:
+            if is_ensemble:
+                # The ensemble's "best hyperparameters" is the config that produced
+                # it, not a fitted model's own hyperparameters (there is no single
+                # one): the same shape a single family stores in this field.
+                best_model = str(predictor.model_best)
+                best_hyperparameters = dict(model.params)
+            elif hpo is not None:
                 best_model = str(predictor.model_best)
                 best_hyperparameters = _best_hyperparameters(predictor, best_model)
         except (Exception, SystemExit) as exc:
@@ -201,7 +258,10 @@ class AutoGluonAdapter:
             raise AutoGluonError("AutoGluon returned the wrong number of validation predictions")
         if probabilities is not None and len(probabilities) != len(validation_features):
             raise AutoGluonError("AutoGluon returned the wrong number of probability rows")
-        _check_trained_models(trained_models, model.family)
+        if is_ensemble:
+            _check_ensemble_trained_models(trained_models, model.params["families"])
+        else:
+            _check_trained_models(trained_models, model.family)
 
         resolved_positive = None
         if task.type == "binary":
@@ -234,7 +294,12 @@ class AutoGluonAdapter:
         No HPO. ``refit_full`` retrains the single fitted model on every provided
         row (AutoGluon otherwise keeps an internal holdout out of a non-bagged fit)
         with the same hyperparameters, and makes it the predictor's best model.
+        For an ENSEMBLE candidate, ``best_hyperparameters`` is the ensemble config
+        (families/num_bag_folds/num_stack_levels) selected during tuning, and
+        ``refit_full`` collapses the whole bagged/stacked/weighted ensemble into a
+        single refit ``_FULL`` predictor trained on every provided row.
         """
+        is_ensemble = model.family == "ENSEMBLE"
         predictor_kwargs: dict[str, Any] = {
             "label": task.target,
             "problem_type": task.type,
@@ -246,25 +311,36 @@ class AutoGluonAdapter:
             predictor_kwargs["positive_class"] = task.positive_class
         if training.seed is not None:
             predictor_kwargs["learner_kwargs"] = {"random_state": training.seed}
-        params = dict(best_hyperparameters)
-        if effective_seed is not None:
-            params[FAMILY_SEED_KEYS[model.family]] = effective_seed
+
+        if is_ensemble:
+            hyperparameters = _ensemble_hyperparameters(
+                best_hyperparameters["families"], effective_seed
+            )
+            resolved_hyperparameters = hyperparameters
+        else:
+            params = dict(best_hyperparameters)
+            if effective_seed is not None:
+                params[FAMILY_SEED_KEYS[model.family]] = effective_seed
+            hyperparameters = {model.family: params}
+            resolved_hyperparameters = params
 
         fit_kwargs: dict[str, Any] = {
             "train_data": train_data.copy(deep=True),
-            "hyperparameters": {model.family: params},
+            "hyperparameters": hyperparameters,
             "hyperparameter_tune_kwargs": None,
-            "fit_weighted_ensemble": False,
+            "fit_weighted_ensemble": is_ensemble,
             "fit_full_last_level_weighted_ensemble": False,
             "full_weighted_ensemble_additionally": False,
-            "num_bag_folds": 0,
-            "num_stack_levels": 0,
+            "num_bag_folds": best_hyperparameters["num_bag_folds"] if is_ensemble else 0,
+            "num_stack_levels": best_hyperparameters["num_stack_levels"] if is_ensemble else 0,
             "dynamic_stacking": False,
             "num_gpus": 0,
             "fit_strategy": "sequential",
             "refit_full": True,
             "set_best_to_refit_full": True,
         }
+        if is_ensemble:
+            fit_kwargs["ag_args_ensemble"] = {"fold_fitting_strategy": "sequential_local"}
         if training.time_limit_seconds is not None:
             fit_kwargs["time_limit"] = training.time_limit_seconds
 
@@ -272,7 +348,10 @@ class AutoGluonAdapter:
             predictor = self._factory()(**predictor_kwargs)
             predictor.fit(**fit_kwargs)
             trained_models = list(predictor.model_names())
-            _check_trained_models(trained_models, model.family)
+            if is_ensemble:
+                _check_ensemble_trained_models(trained_models, best_hyperparameters["families"])
+            else:
+                _check_trained_models(trained_models, model.family)
             frame = test_features.copy(deep=True)
             probabilities = None
             if task.type in {"binary", "multiclass"}:
@@ -302,5 +381,5 @@ class AutoGluonAdapter:
             trained_models=trained_models,
             autogluon_version=self._version_resolver(),
             best_model=best_model,
-            best_hyperparameters=params,
+            best_hyperparameters=resolved_hyperparameters,
         )

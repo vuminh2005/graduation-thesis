@@ -13,7 +13,13 @@ import yaml
 
 SUPPORTED_TASKS = {"binary", "multiclass", "regression"}
 SUPPORTED_FORMATS = {"auto", "csv", "parquet"}
-SUPPORTED_MODEL_FAMILIES = {"GBM", "CAT", "XGB", "RF", "XT"}
+# The five isolated single-family candidates from Phase 4 onward.
+SINGLE_MODEL_FAMILIES = {"GBM", "CAT", "XGB", "RF", "XT"}
+# Phase 8 adds ENSEMBLE: several of the families above, bagged/stacked/weighted
+# by AutoGluon itself, as one more candidate in the FeatureSet x model matrix.
+SUPPORTED_MODEL_FAMILIES = SINGLE_MODEL_FAMILIES | {"ENSEMBLE"}
+# families defaults to all five single families, in this documented order.
+DEFAULT_ENSEMBLE_FAMILIES = ["GBM", "CAT", "XGB", "RF", "XT"]
 SUPPORTED_METRICS = {
     "binary": {"roc_auc", "f1", "accuracy", "log_loss"},
     "multiclass": {"accuracy", "f1_macro", "log_loss"},
@@ -206,6 +212,56 @@ def _json_mapping(value: Any, qualified_name: str) -> dict[str, Any]:
     return dict(value)
 
 
+def _ensemble_params(params_raw: dict[str, Any], prefix: str) -> dict[str, Any]:
+    """Validate and normalize an ``ENSEMBLE`` model's params, defaults filled in.
+
+    Kept as a plain JSON-serializable dict in ``ModelConfig.params`` (like every
+    other family) rather than a new dataclass field, so every place that already
+    forwards ``model.params`` verbatim (training/tuning/finalize results,
+    ``selected.json``, the registry, MLflow params) exposes the ensemble
+    configuration for free.
+    """
+    _reject_unknown(params_raw, {"families", "num_bag_folds", "num_stack_levels"}, f"{prefix}.params")
+
+    families = params_raw.get("families", list(DEFAULT_ENSEMBLE_FAMILIES))
+    if not isinstance(families, list) or not families:
+        raise ConfigError(f'"{prefix}.params.families" must be a non-empty list')
+    if not all(isinstance(family, str) for family in families):
+        raise ConfigError(f'"{prefix}.params.families" must be a list of strings')
+    if len(families) != len(set(families)):
+        raise ConfigError(f'"{prefix}.params.families" must contain unique values')
+    unsupported = [family for family in families if family not in SINGLE_MODEL_FAMILIES]
+    if unsupported:
+        supported = ", ".join(sorted(SINGLE_MODEL_FAMILIES))
+        raise ConfigError(
+            f'"{prefix}.params.families" contains unsupported family "{unsupported[0]}" '
+            f'(ENSEMBLE may not nest itself); expected a subset of: {supported}'
+        )
+
+    num_bag_folds = params_raw.get("num_bag_folds", 3)
+    if isinstance(num_bag_folds, bool) or not isinstance(num_bag_folds, int) or (
+        num_bag_folds != 0 and num_bag_folds < 2
+    ):
+        raise ConfigError(f'"{prefix}.params.num_bag_folds" must be 0 or an integer >= 2')
+
+    num_stack_levels = params_raw.get("num_stack_levels", 1)
+    if isinstance(num_stack_levels, bool) or not isinstance(num_stack_levels, int) or (
+        num_stack_levels < 0
+    ):
+        raise ConfigError(f'"{prefix}.params.num_stack_levels" must be a non-negative integer')
+    if num_stack_levels > 0 and num_bag_folds < 2:
+        raise ConfigError(
+            f'"{prefix}.params.num_stack_levels" greater than 0 requires '
+            f'"{prefix}.params.num_bag_folds" to be at least 2'
+        )
+
+    return {
+        "families": list(families),
+        "num_bag_folds": num_bag_folds,
+        "num_stack_levels": num_stack_levels,
+    }
+
+
 def _model_config(raw: dict[str, Any]) -> list[ModelConfig]:
     models_raw = raw.get("models", [])
     if not isinstance(models_raw, list):
@@ -231,7 +287,13 @@ def _model_config(raw: dict[str, Any]) -> list[ModelConfig]:
             raise ConfigError(
                 f'unsupported model family "{family}"; expected one of: {supported}'
             )
-        params = _json_mapping(model_raw.get("params", {}), f"{prefix}.params")
+        params_raw = model_raw.get("params", {})
+        if not isinstance(params_raw, dict) or not all(isinstance(key, str) for key in params_raw):
+            raise ConfigError(f'"{prefix}.params" must be a mapping with string keys')
+        if family == "ENSEMBLE":
+            params = _ensemble_params(params_raw, prefix)
+        else:
+            params = _json_mapping(params_raw, f"{prefix}.params")
         models.append(ModelConfig(name=name, family=family, params=params))
     return models
 
