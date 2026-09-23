@@ -41,6 +41,30 @@ def _flatten(prefix: str, values: dict[str, Any] | None) -> dict[str, Any]:
     return {f"{prefix}.{key}": value for key, value in (values or {}).items()}
 
 
+def search_space_text(spec: dict[str, Any]) -> str:
+    """``real[0.005,0.2,log]``, ``int[16,128,default=31]``, ``categorical[true,false]``."""
+    if spec["type"] == "categorical":
+        parts = [json.dumps(value) for value in spec["values"]]
+    else:
+        parts = [json.dumps(spec["low"]), json.dumps(spec["high"])]
+        if spec.get("log"):
+            parts.append("log")
+    if spec.get("default") is not None and spec["type"] != "categorical":
+        parts.append(f"default={json.dumps(spec['default'])}")
+    return f"{spec['type']}[{','.join(parts)}]"
+
+
+def _search_space_params(result: dict[str, Any]) -> dict[str, str]:
+    """``ss.<key>`` for each declared range, ``ss_default.<key>`` for each of
+    AutoGluon's default ranges that the merge left searched."""
+    params = {f"ss.{key}": search_space_text(spec)
+              for key, spec in (result.get("search_space") or {}).items()}
+    for key, spec in (result.get("effective_search_space") or {}).items():
+        if spec.get("source") == "autogluon_default":
+            params[f"ss_default.{key}"] = search_space_text(spec)
+    return params
+
+
 def _cv_metrics(result: dict[str, Any]) -> tuple[dict[str, float], list[dict[str, Any]], dict[str, Any]]:
     """Std metrics, the per-fold series and cv params for a cross-validated result."""
     cv = result.get("cv")
@@ -170,7 +194,9 @@ def log_tuning(config: MLToolConfig, result_set: Any):
                 "seed": result.get("seed"),
                 "effective_seed": result.get("effective_seed"),
                 "primary_metric": config.evaluation.primary_metric,
+                "searcher": hpo.searcher if hpo else None,
                 **_flatten("hp", result.get("best_hyperparameters")),
+                **_search_space_params(result),
             }
             metrics = dict(result.get("metrics", {}))
             if "phase4_primary_score" in result:
@@ -220,6 +246,7 @@ def log_final(config: MLToolConfig, final: Any):
             "train_validation_rows": result["rows"]["train_validation"],
             "test_rows": result["rows"]["test"],
             **_flatten("hp", result.get("best_hyperparameters")),
+            **_search_space_params(result),
         }
         metrics = {f"test_{name}": value for name, value in result["metrics"].items()}
         metrics["selected_validation_score"] = result["selected_validation_score"]

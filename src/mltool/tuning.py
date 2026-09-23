@@ -17,8 +17,9 @@ from mltool.autogluon_adapter import (
     AutoGluonAdapter,
     AutoGluonError,
     effective_model_seed,
+    effective_search_space,
 )
-from mltool.config import MLToolConfig, ModelConfig, TrainingConfig
+from mltool.config import HpoConfig, MLToolConfig, ModelConfig, TrainingConfig
 from mltool.evaluation import EvaluationError, evaluate_predictions
 from mltool.experiment import CandidateSpec, ExperimentPlan, sha256_file
 from mltool.cross_validation import (
@@ -47,7 +48,7 @@ from mltool.training import (
 def no_search_space_warning(family: str) -> str:
     return (
         f"HPO has no default search space for family {family}; this candidate ran "
-        "with default hyperparameters, not tuned"
+        "with default hyperparameters, not tuned (declare a search_space to tune it)"
     )
 
 
@@ -58,18 +59,35 @@ def ensemble_hpo_not_applied_warning() -> str:
     )
 
 
-def hpo_not_applicable_warning(family: str) -> str | None:
-    """Why HPO does not tune this family, or ``None`` when it does.
+def hpo_not_applicable_warning(
+    family: str, search_space: dict[str, Any] | None = None
+) -> str | None:
+    """Why HPO does not tune this candidate, or ``None`` when it does.
 
     Kept as one lookup so ``hpo_effective``/``hpo_warning`` stay uniform across
-    every reason a candidate isn't tuned: no AutoGluon search space (RF/XT) or,
-    for ENSEMBLE, tuning combined with bagging being out of scope by design.
+    every reason a candidate isn't tuned: no search space at all (RF/XT, which
+    have no AutoGluon default, unless the user declared one) or, for ENSEMBLE,
+    tuning combined with bagging being out of scope by design.
     """
-    if family in NO_SEARCH_SPACE_FAMILIES:
+    if family in NO_SEARCH_SPACE_FAMILIES and not search_space:
         return no_search_space_warning(family)
     if family == "ENSEMBLE":
         return ensemble_hpo_not_applied_warning()
     return None
+
+
+def _searched_lines(effective: dict[str, Any] | None) -> list[str]:
+    """Which hyperparameters were searched, split by where their range came from."""
+    if not effective:
+        return []
+    declared = [key for key, spec in effective.items() if spec.get("source") == "user"]
+    defaults = [key for key, spec in effective.items() if spec.get("source") != "user"]
+    parts = []
+    if declared:
+        parts.append(f"declared {', '.join(declared)}")
+    if defaults:
+        parts.append(f"AutoGluon default {', '.join(defaults)}")
+    return [f"      searched: {'; '.join(parts)}"]
 
 
 class TuningError(ValueError):
@@ -135,6 +153,7 @@ class TuningResult:
                     lines.append(
                         f"      trained models (trials): {len(result['trained_models'])}"
                     )
+                    lines.extend(_searched_lines(result.get("effective_search_space")))
                 cv = result.get("cv")
                 std = cv["metric_std"] if cv else None
                 folds = cv["total_fits_per_candidate"] if cv else None
@@ -346,9 +365,26 @@ def tuned_model_config(
     return candidate.model
 
 
-def is_tunable(family: str) -> bool:
-    """GBM/CAT/XGB have an AutoGluon search space; RF/XT and ENSEMBLE do not."""
-    return hpo_not_applicable_warning(family) is None
+def is_tunable(model: ModelConfig) -> bool:
+    """GBM/CAT/XGB have an AutoGluon default search space; RF/XT only with a declared one."""
+    return hpo_not_applicable_warning(model.family, model.search_space) is None
+
+
+def hpo_record(hpo: HpoConfig) -> dict[str, Any]:
+    """The HPO settings as persisted, and compared, in the tuning manifest."""
+    return {
+        "top_n": hpo.top_n,
+        "num_trials": hpo.num_trials,
+        "time_limit_seconds": hpo.time_limit_seconds,
+        "scheduler": "local",
+        "searcher": hpo.searcher,
+    }
+
+
+def search_space_signature(config: MLToolConfig) -> dict[str, Any]:
+    """Declared search spaces by model name; models without one are omitted, so a
+    manifest written before search spaces existed reads as an empty mapping."""
+    return {model.name: model.search_space for model in config.models if model.search_space}
 
 
 def _read_training_candidate(config: MLToolConfig, candidate: CandidateSpec) -> dict[str, Any]:
@@ -439,16 +475,15 @@ def _carried_over_result(
         "positive_class": training_result.get("positive_class"),
         "target_conversion_applied": training_result.get("target_conversion_applied"),
         "training_seconds": 0.0,
-        "hpo": {
-            "num_trials": config.hpo.num_trials,
-            "time_limit_seconds": config.hpo.time_limit_seconds,
-            "scheduler": "local",
-            "searcher": "random",
-        },
+        "hpo": hpo_record(config.hpo),
         "seed": training_result.get("seed"),
         "effective_seed": training_result.get("effective_seed"),
         "hpo_effective": False,
-        "hpo_warning": hpo_not_applicable_warning(candidate.model.family),
+        "hpo_warning": hpo_not_applicable_warning(
+            candidate.model.family, candidate.model.search_space
+        ),
+        "search_space": candidate.model.search_space,
+        "effective_search_space": {},
         "carried_over_from_training": True,
         "training_result": str(
             config.config_path.parent
@@ -482,7 +517,7 @@ def _tune_candidate(
     train, validation_features, validation_target, converted = _prepare_candidate_frames(
         plan, candidate
     )
-    hpo_warning = hpo_not_applicable_warning(candidate.model.family)
+    hpo_warning = hpo_not_applicable_warning(candidate.model.family, candidate.model.search_space)
     # Only tunable families reach here; RF/XT and ENSEMBLE are carried over
     # from training by ``tune_experiment`` without a fit.
     output = adapter.fit_predict(
@@ -544,12 +579,11 @@ def _tune_candidate(
         "positive_class": output.positive_class,
         "target_conversion_applied": converted,
         "training_seconds": float(time.perf_counter() - started),
-        "hpo": {
-            "num_trials": plan.config.hpo.num_trials,
-            "time_limit_seconds": plan.config.hpo.time_limit_seconds,
-            "scheduler": "local",
-            "searcher": "random",
-        },
+        "hpo": hpo_record(plan.config.hpo),
+        "search_space": candidate.model.search_space,
+        "effective_search_space": effective_search_space(
+            candidate.model, plan.config.task.type
+        ),
         "seed": plan.config.training.seed,
         "effective_seed": effective_model_seed(candidate.model, plan.config.training),
         "hpo_effective": hpo_warning is None,
@@ -607,6 +641,8 @@ def build_selected_configuration(
         "best_model": result["best_model"],
         "hpo_effective": result["hpo_effective"],
         "hpo_warning": result["hpo_warning"],
+        "search_space": result.get("search_space", {}),
+        "effective_search_space": result.get("effective_search_space", {}),
         "seed": result["seed"],
         "effective_seed": result["effective_seed"],
         "primary_metric": primary_metric,
@@ -649,7 +685,7 @@ def tune_experiment(
     # result fails the command before any tunable candidate spends a fit.
     carried: dict[str, dict[str, Any]] = {}
     for candidate in selection.candidates:
-        if not is_tunable(candidate.model.family):
+        if not is_tunable(candidate.model):
             training_result = _read_training_candidate(config, candidate)
             _validate_carry_over(plan, candidate, training_result, cv_plan)
             carried[candidate.candidate_id] = training_result
@@ -727,13 +763,8 @@ def tune_experiment(
                 ),
                 _autogluon_version(),
             ),
-            "hpo": {
-                "top_n": config.hpo.top_n,
-                "num_trials": config.hpo.num_trials,
-                "time_limit_seconds": config.hpo.time_limit_seconds,
-                "scheduler": "local",
-                "searcher": "random",
-            },
+            "hpo": hpo_record(config.hpo),
+            "search_spaces": search_space_signature(config),
             "seed": config.training.seed,
             "effective_seed": {
                 candidate.candidate_id: effective_model_seed(candidate.model, config.training)
@@ -813,13 +844,11 @@ def load_persisted_tuning(config: MLToolConfig) -> PersistedTuning:
         "models": manifest.get("models"),
     }
     expected = _config_signature(config)
-    hpo_matches = config.hpo is not None and manifest.get("hpo") == {
-        "top_n": config.hpo.top_n,
-        "num_trials": config.hpo.num_trials,
-        "time_limit_seconds": config.hpo.time_limit_seconds,
-        "scheduler": "local",
-        "searcher": "random",
-    }
+    hpo_matches = (
+        config.hpo is not None
+        and manifest.get("hpo") == hpo_record(config.hpo)
+        and manifest.get("search_spaces", {}) == search_space_signature(config)
+    )
     warning = None
     if signature != expected or not hpo_matches:
         warning = "current config differs from the config used to create this tuning leaderboard"

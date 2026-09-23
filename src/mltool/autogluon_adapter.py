@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib.metadata import version
+import json
 from pathlib import Path
 import re
 from typing import Any, Callable
 
 import pandas as pd
 
-from mltool.config import HpoConfig, ModelConfig, TaskConfig, TrainingConfig
+from mltool.config import FAMILY_SEED_KEYS, HpoConfig, ModelConfig, TaskConfig, TrainingConfig
 from mltool.resources import resolve_resource_limits
 
 
@@ -38,17 +39,109 @@ FAMILY_MODEL_TOKENS = {
 # controlled by (a) the learner's random_state (internal holdout split), set via
 # TabularPredictor(learner_kwargs=...), and (b) each model's own seed
 # hyperparameter, whose name is family specific (AbstractModel.seed_name).
-FAMILY_SEED_KEYS = {
-    "GBM": "seed",
-    "CAT": "random_seed",
-    "XGB": "seed",
-    "RF": "random_state",
-    "XT": "random_state",
-}
+# FAMILY_SEED_KEYS lives in mltool.config, which needs it to validate search_space.
 
 # Families for which AutoGluon defines no default hyperparameter search space:
 # with hyperparameter_tune_kwargs they train a single default model.
 NO_SEARCH_SPACE_FAMILIES = frozenset({"RF", "XT"})
+
+# MLTool's hpo.searcher -> the installed AutoGluon's local (Ray-free) searcher
+# (autogluon/core/searcher/searcher_factory.py:6-13). "random" is kept verbatim:
+# LocalSequentialScheduler.get_searcher_ rewrites it to "local_random"
+# (autogluon/core/scheduler/seq_scheduler.py:128-130).
+AUTOGLUON_SEARCHERS = {"random": "random", "grid": "local_grid"}
+
+
+def autogluon_spaces(search_space: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """MLTool's normalized specs as ``autogluon.common.space`` objects.
+
+    ``Real(lower, upper, default=None, log=False)`` and ``Int(lower, upper,
+    default=None)`` default to ``lower`` when no default is given
+    (autogluon/common/space.py:107-117, 147-152); ``Categorical(*data)`` always
+    defaults to its first value (space.py:62-64), so a declared default is moved
+    to the front.
+    """
+    from autogluon.common import space
+
+    spaces: dict[str, Any] = {}
+    for key, spec in search_space.items():
+        if spec["type"] == "real":
+            spaces[key] = space.Real(
+                spec["low"], spec["high"], default=spec.get("default"), log=spec["log"]
+            )
+        elif spec["type"] == "int":
+            spaces[key] = space.Int(spec["low"], spec["high"], default=spec.get("default"))
+        else:
+            values = list(spec["values"])
+            if "default" in spec:
+                wanted = json.dumps(spec["default"])
+                first = next(i for i, value in enumerate(values) if json.dumps(value) == wanted)
+                values.insert(0, values.pop(first))
+            spaces[key] = space.Categorical(*values)
+    return spaces
+
+
+def _default_search_space(family: str, task_type: str) -> dict[str, Any]:
+    """The installed AutoGluon's default search space for one family."""
+    if family == "GBM":
+        from autogluon.tabular.models.lgb.hyperparameters.searchspaces import (
+            get_default_searchspace,
+        )
+
+        return get_default_searchspace(problem_type=task_type)
+    if family == "CAT":
+        from autogluon.tabular.models.catboost.hyperparameters.searchspaces import (
+            get_default_searchspace,
+        )
+
+        return get_default_searchspace(task_type)
+    if family == "XGB":
+        from autogluon.tabular.models.xgboost.hyperparameters.searchspaces import (
+            get_default_searchspace,
+        )
+
+        return get_default_searchspace(problem_type=task_type)
+    # RFModel._get_default_searchspace returns {} (rf/rf_model.py:114-120) and
+    # XTModel subclasses RFModel (xt/xt_model.py:8).
+    return {}
+
+
+def _space_record(value: Any) -> dict[str, Any]:
+    from autogluon.common import space
+
+    if isinstance(value, space.Real):
+        return {"type": "real", "low": value.lower, "high": value.upper, "log": value.log,
+                "default": value.default}
+    if isinstance(value, space.Categorical):
+        return {"type": "categorical", "values": list(value.data), "default": value.default}
+    if isinstance(value, space.Int):
+        return {"type": "int", "low": value.lower, "high": value.upper, "default": value.default}
+    raise AutoGluonError(f"unsupported AutoGluon search space: {value!r}")
+
+
+def effective_search_space(model: ModelConfig, task_type: str) -> dict[str, dict[str, Any]]:
+    """Everything HPO will search for this candidate, and where each range came from.
+
+    Mirrors ``AbstractModel._get_search_space`` (autogluon/core/models/abstract/
+    abstract_model.py:610-620): every key the user put in the model's
+    hyperparameters -- a fixed value or a Space -- is removed from the default
+    search space, and the remaining default ranges are still searched. So a
+    declared ``search_space`` is merged into AutoGluon's default, not a replacement.
+    ``default`` is the value AutoGluon tries first (random searcher only).
+    """
+    if model.family == "ENSEMBLE":
+        return {}
+    from autogluon.common import space
+
+    user_keys = set(model.params) | set(model.search_space) | {FAMILY_SEED_KEYS[model.family]}
+    effective = {
+        key: {**_space_record(value), "source": "autogluon_default"}
+        for key, value in _default_search_space(model.family, task_type).items()
+        if isinstance(value, space.Space) and key not in user_keys
+    }
+    for key, value in autogluon_spaces(model.search_space).items():
+        effective[key] = {**_space_record(value), "source": "user"}
+    return dict(sorted(effective.items()))
 
 
 def effective_model_seed(model: ModelConfig, training: TrainingConfig) -> Any | None:
@@ -213,6 +306,10 @@ class AutoGluonAdapter:
             assert model_params.get(FAMILY_SEED_KEYS[model.family]) == effective_model_seed(
                 model, training
             )
+            if hpo is not None:
+                # Only a search passes Space objects: AutoGluon does not reject
+                # one without HPO, it would hand the object to the model as a value.
+                model_params.update(autogluon_spaces(model.search_space))
             hyperparameters = {model.family: model_params}
 
         fit_kwargs: dict[str, Any] = {
@@ -238,7 +335,7 @@ class AutoGluonAdapter:
             fit_kwargs["hyperparameter_tune_kwargs"] = {
                 "num_trials": hpo.num_trials,
                 "scheduler": "local",
-                "searcher": "random",
+                "searcher": AUTOGLUON_SEARCHERS[hpo.searcher],
             }
             fit_kwargs["time_limit"] = hpo.time_limit_seconds
         elif training.time_limit_seconds is not None:

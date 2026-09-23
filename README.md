@@ -142,6 +142,7 @@ hpo:
   top_n: 3               # best Phase-4 SUCCEEDED candidates to tune (default 3)
   num_trials: 10         # HPO trials per candidate (default 10)
   time_limit_seconds: 600  # required; hard budget per candidate
+  searcher: random       # random (default) or grid; see "Search spaces" below
 ```
 
 It refuses to run on stale training artifacts, re-fits each selected candidate
@@ -149,8 +150,8 @@ on its FeatureSet train split with a local, sequential random search
 (`num_trials`, `time_limit_seconds`), and evaluates on the validation split only.
 Bagging, stacking, weighted ensembles, GPUs, and test data stay off. Params you
 fix in a model's `params` stay fixed; the rest of AutoGluon's default search
-space is tuned. Families `tune` cannot tune — RF and XT (no default AutoGluon
-search space) and ENSEMBLE (HPO is not combined with bagging/stacking) — are
+space is tuned. Families `tune` cannot tune — RF and XT without a declared
+`search_space` (AutoGluon has no default one for them) and ENSEMBLE (HPO is not combined with bagging/stacking) — are
 **not fitted at all**: re-fitting the same configuration with the same seed on
 the same rows would only reproduce training's scores, so `tune` copies the
 candidate's training result as-is (holdout metrics, or the per-fold CV metrics
@@ -160,6 +161,65 @@ and fold fingerprint) and marks it `carried_over_from_training: true`,
 is refused, before any candidate is fitted, if the training artifacts are stale,
 the seed changed, or (with CV) the fold assignment no longer matches. `finalize`
 still refits the selected configuration from scratch either way.
+
+**Search spaces (Phase 10).** A model can declare what `tune` searches:
+
+```yaml
+models:
+  - name: lgbm
+    family: GBM
+    params: {min_data_in_leaf: 20}          # fixed, never searched
+    search_space:
+      learning_rate: {type: real, low: 0.005, high: 0.2, log: true}
+      num_leaves:    {type: int, low: 16, high: 128, default: 31}
+      extra_trees:   {type: categorical, values: [true, false]}
+```
+
+- `real`: `low`, `high`, optional `log` (requires `low > 0`), optional `default`.
+- `int`: integer `low`, `high`, optional `default`. There is no `log` for integers:
+  the installed AutoGluon's `Int(lower, upper, default)` has no log scale.
+- `categorical`: `values`, a non-empty list of unique JSON scalars (`true` and `1`
+  are different values), optional `default` (one of `values`).
+- `low < high`, defaults inside the bounds, and unknown keys are rejected. A
+  hyperparameter is either fixed in `params` or searched, never both; the family's
+  seed (`seed`, `random_seed`, `random_state`) cannot be searched; ENSEMBLE cannot
+  declare a search space. Hyperparameter *names* are not validated: they go to the
+  underlying library as given, so a misspelt name is searched and ignored (or makes
+  every trial fail, which ends HPO early with an AutoGluon warning).
+
+*Declared ranges are merged into AutoGluon's default search space, not a
+replacement for it.* AutoGluon removes every key you set — fixed in `params` or
+declared in `search_space` — from the model's default space and keeps searching
+the rest (`AbstractModel._get_search_space`). With the installed AutoGluon 1.6.3
+the defaults are: GBM `learning_rate`, `feature_fraction`, `min_data_in_leaf`,
+`num_leaves`; CAT `learning_rate`, `depth`, `l2_leaf_reg`; XGB `learning_rate`,
+`max_depth`, `min_child_weight`, `colsample_bytree`; RF and XT none. So the
+example above searches `learning_rate`, `num_leaves` and `extra_trees` as declared
+**and** AutoGluon's `feature_fraction`; `min_data_in_leaf` is fixed. To stop a
+default range from being searched, fix that key in `params`. Each tuning
+`result.json` and `selected.json` records the declared `search_space` and the
+`effective_search_space` (every searched key with its range and a `source` of
+`user` or `autogluon_default`), the `tune` report prints a `searched:` line, and
+MLflow logs `ss.<key>` for declared ranges and `ss_default.<key>` for the default
+ranges still searched. `finalize`, the final manifest and the registry metadata
+carry the selected model's spaces.
+
+RF and XT **with** a `search_space` are tuned (`hpo_effective: true`) instead of
+carried over. Changing a `search_space` never makes `train` stale (training
+ignores it), but it makes the tuning artifacts stale for `tune` and `finalize`,
+and a final model stale if the *selected* model's search space changed.
+
+The random searcher tries each range's `default` in its first trial, then samples
+at random. When you omit `default`, AutoGluon uses `low` for `real`/`int` and the
+first value for `categorical` — so trial 1 of an undeclared-default
+`learning_rate: {low: 0.005, ...}` runs at 0.005, not at a typical value. Declare
+a `default` if the first trial matters. `searcher: grid` uses AutoGluon's local
+grid searcher instead: 4 evenly spaced points per `real`/`int` range (log-spaced
+when `log: true`), every `categorical` value, walked in a fixed order and cut off
+at `num_trials`; it ignores `default`. When a grid is exhausted before
+`num_trials`, AutoGluon stops the search with a "stopping HPO early" warning and
+a traceback in the log; that is expected, not a failure. Both searchers run
+locally without Ray.
 
 **Resource limits.** AutoGluon sizes its memory guard from the host's total RAM,
 so a process capped by a cgroup (`systemd-run -p MemoryMax=8G`, a container)

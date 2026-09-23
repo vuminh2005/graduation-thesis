@@ -47,6 +47,8 @@ from mltool.training import (
 )
 from mltool.tuning import (
     TuningError,
+    hpo_record,
+    search_space_signature,
     _read_training_artifacts,
     _validate_training_freshness,
 )
@@ -233,14 +235,10 @@ def load_finalize_input(plan: ExperimentPlan) -> FinalizeInput:
     for key, value in _config_signature(config).items():
         if signature[key] != value:
             raise _stale(f'tuning artifacts are stale ("{key}" differs from the current config)', "tune")
-    if config.hpo is None or tuning_manifest.get("hpo") != {
-        "top_n": config.hpo.top_n,
-        "num_trials": config.hpo.num_trials,
-        "time_limit_seconds": config.hpo.time_limit_seconds,
-        "scheduler": "local",
-        "searcher": "random",
-    }:
+    if config.hpo is None or tuning_manifest.get("hpo") != hpo_record(config.hpo):
         raise _stale("tuning artifacts are stale (hpo configuration differs)", "tune")
+    if tuning_manifest.get("search_spaces", {}) != search_space_signature(config):
+        raise _stale("tuning artifacts are stale (a model's search_space differs)", "tune")
     if tuning_manifest.get("seed") != config.training.seed:
         raise _stale("tuning artifacts are stale (training.seed differs)", "tune")
     if tuning_manifest.get("training_manifest_sha256") != sha256_file(
@@ -464,6 +462,8 @@ def finalize_experiment(
             "best_hyperparameters": selected["best_hyperparameters"],
             "hpo_effective": selected.get("hpo_effective"),
             "hpo_warning": selected.get("hpo_warning"),
+            "search_space": selected.get("search_space", {}),
+            "effective_search_space": selected.get("effective_search_space", {}),
             "fit_hyperparameters": output.best_hyperparameters,
             "seed": config.training.seed,
             "effective_seed": selected.get("effective_seed"),
@@ -514,6 +514,8 @@ def finalize_experiment(
                 "best_hyperparameters": selected["best_hyperparameters"],
                 "hpo_effective": selected.get("hpo_effective"),
                 "hpo_warning": selected.get("hpo_warning"),
+                "search_space": selected.get("search_space", {}),
+                "effective_search_space": selected.get("effective_search_space", {}),
             },
             "hpo_effective": selected.get("hpo_effective"),
             "hpo_warning": selected.get("hpo_warning"),
@@ -644,8 +646,17 @@ def load_persisted_final(config: MLToolConfig) -> PersistedFinal:
     warning = _upstream_staleness(config, manifest)
     if warning is not None:
         return PersistedFinal(manifest=manifest, result=result, warning=warning)
+    selected_model = next(
+        (m for m in config.models if m.name == manifest["selected"].get("model", {}).get("name")),
+        None,
+    )
     if signature != _config_signature(config) or manifest.get("seed") != config.training.seed:
         warning = "current config differs from the config used to create this final model"
+    elif selected_model is not None and manifest["selected"].get(
+        "search_space", {}
+    ) != selected_model.search_space:
+        # A final model written before search spaces existed searched none.
+        warning = "the selected model's search space changed after this final model was created"
     else:
         try:
             current = json.loads(

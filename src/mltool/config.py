@@ -42,6 +42,16 @@ METRIC_DIRECTIONS = {
     "mae": "minimize",
 }
 SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+# Each family's own seed hyperparameter (AutoGluon's AbstractModel.seed_name).
+FAMILY_SEED_KEYS = {
+    "GBM": "seed",
+    "CAT": "random_seed",
+    "XGB": "seed",
+    "RF": "random_state",
+    "XT": "random_state",
+}
+# Local (Ray-free) searchers of the installed AutoGluon; "grid" is its local_grid.
+SUPPORTED_SEARCHERS = ("random", "grid")
 SAFE_FEATURE_SET_NAME = SAFE_IDENTIFIER
 SAFE_PLUGIN_NAME = SAFE_IDENTIFIER
 
@@ -122,6 +132,9 @@ class ModelConfig:
     name: str
     family: str
     params: dict[str, Any] = field(default_factory=dict)
+    # Normalized specs, e.g. {"learning_rate": {"type": "real", "low": 0.005,
+    # "high": 0.2, "log": True}}; used by ``tune`` only, never by ``train``.
+    search_space: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -165,6 +178,7 @@ class HpoConfig:
     top_n: int
     num_trials: int
     time_limit_seconds: int
+    searcher: str = "random"
 
 
 @dataclass(frozen=True)
@@ -282,6 +296,99 @@ def _ensemble_params(params_raw: dict[str, Any], prefix: str) -> dict[str, Any]:
     }
 
 
+def _number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(
+        value
+    )
+
+
+def _integer(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _search_space_entry(spec: Any, where: str) -> dict[str, Any]:
+    """One declared hyperparameter range, normalized to a canonical JSON form."""
+    if not isinstance(spec, dict):
+        raise ConfigError(f'"{where}" must be a mapping')
+    kind = spec.get("type")
+    if kind == "real":
+        _reject_unknown(spec, {"type", "low", "high", "log", "default"}, where)
+        low, high, log = spec.get("low"), spec.get("high"), spec.get("log", False)
+        if not _number(low) or not _number(high):
+            raise ConfigError(f'"{where}.low" and "{where}.high" must be numbers')
+        if not isinstance(log, bool):
+            raise ConfigError(f'"{where}.log" must be true or false')
+        entry: dict[str, Any] = {"type": "real", "low": float(low), "high": float(high), "log": log}
+    elif kind == "int":
+        # autogluon.common.space.Int(lower, upper, default) has no log scale.
+        _reject_unknown(spec, {"type", "low", "high", "default"}, where)
+        low, high = spec.get("low"), spec.get("high")
+        if not _integer(low) or not _integer(high):
+            raise ConfigError(f'"{where}.low" and "{where}.high" must be integers')
+        entry = {"type": "int", "low": low, "high": high}
+    elif kind == "categorical":
+        _reject_unknown(spec, {"type", "values", "default"}, where)
+        values = spec.get("values")
+        if not isinstance(values, list) or not values:
+            raise ConfigError(f'"{where}.values" must be a non-empty list')
+        if not all(v is None or isinstance(v, (str, bool, int)) or _number(v) for v in values):
+            raise ConfigError(f'"{where}.values" must contain only JSON scalars')
+        # JSON identity, so true and 1 stay distinct
+        encoded = [json.dumps(value) for value in values]
+        if len(set(encoded)) != len(encoded):
+            raise ConfigError(f'"{where}.values" must contain unique values')
+        entry = {"type": "categorical", "values": list(values)}
+        if "default" in spec:
+            if json.dumps(spec["default"]) not in encoded:
+                raise ConfigError(f'"{where}.default" must be one of "{where}.values"')
+            entry["default"] = spec["default"]
+        return entry
+    else:
+        raise ConfigError(f'"{where}.type" must be one of: real, int, categorical')
+
+    if not entry["low"] < entry["high"]:
+        raise ConfigError(f'"{where}.low" must be less than "{where}.high"')
+    if entry.get("log") and entry["low"] <= 0:
+        raise ConfigError(f'"{where}.log" requires "{where}.low" greater than 0')
+    if "default" in spec:
+        default = spec["default"]
+        valid = _integer(default) if kind == "int" else _number(default)
+        if not valid or not entry["low"] <= default <= entry["high"]:
+            raise ConfigError(
+                f'"{where}.default" must be a {"integer" if kind == "int" else "number"} '
+                f'within [low, high]'
+            )
+        entry["default"] = default if kind == "int" else float(default)
+    return entry
+
+
+def _search_space(
+    raw: Any, prefix: str, family: str, params: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    where = f"{prefix}.search_space"
+    if raw is None:
+        return {}
+    if family == "ENSEMBLE":
+        raise ConfigError(
+            f'"{where}" is not supported for ENSEMBLE; HPO is excluded for ENSEMBLE by design'
+        )
+    if not isinstance(raw, dict) or not all(isinstance(key, str) and key for key in raw):
+        raise ConfigError(f'"{where}" must be a mapping with non-empty string keys')
+    overlap = sorted(set(raw) & set(params))
+    if overlap:
+        raise ConfigError(
+            f'"{where}" and "{prefix}.params" both set: {", ".join(overlap)}; '
+            "a hyperparameter is either fixed or searched"
+        )
+    seed_key = FAMILY_SEED_KEYS[family]
+    if seed_key in raw:
+        raise ConfigError(
+            f'"{where}.{seed_key}" is the {family} seed, set by training.seed or params; '
+            "it cannot be searched"
+        )
+    return {key: _search_space_entry(spec, f"{where}.{key}") for key, spec in raw.items()}
+
+
 def _model_config(raw: dict[str, Any]) -> list[ModelConfig]:
     models_raw = raw.get("models", [])
     if not isinstance(models_raw, list):
@@ -292,7 +399,7 @@ def _model_config(raw: dict[str, Any]) -> list[ModelConfig]:
         prefix = f"models[{index}]"
         if not isinstance(model_raw, dict):
             raise ConfigError(f'"{prefix}" must be a mapping')
-        _reject_unknown(model_raw, {"name", "family", "params"}, prefix)
+        _reject_unknown(model_raw, {"name", "family", "params", "search_space"}, prefix)
         name = _non_empty_string(model_raw, "name", f"{prefix}.name")
         if not SAFE_IDENTIFIER.fullmatch(name):
             raise ConfigError(
@@ -314,7 +421,10 @@ def _model_config(raw: dict[str, Any]) -> list[ModelConfig]:
             params = _ensemble_params(params_raw, prefix)
         else:
             params = _json_mapping(params_raw, f"{prefix}.params")
-        models.append(ModelConfig(name=name, family=family, params=params))
+        search_space = _search_space(model_raw.get("search_space"), prefix, family, params)
+        models.append(
+            ModelConfig(name=name, family=family, params=params, search_space=search_space)
+        )
     return models
 
 
@@ -427,11 +537,15 @@ def _hpo_config(raw: dict[str, Any]) -> HpoConfig | None:
     hpo_raw = raw["hpo"]
     if not isinstance(hpo_raw, dict):
         raise ConfigError('configuration section "hpo" must be a mapping')
-    _reject_unknown(hpo_raw, {"top_n", "num_trials", "time_limit_seconds"}, "hpo")
+    _reject_unknown(hpo_raw, {"top_n", "num_trials", "time_limit_seconds", "searcher"}, "hpo")
+    searcher = hpo_raw.get("searcher", "random")
+    if searcher not in SUPPORTED_SEARCHERS:
+        raise ConfigError(f'"hpo.searcher" must be one of: {", ".join(SUPPORTED_SEARCHERS)}')
     return HpoConfig(
         top_n=_positive_int(hpo_raw, "top_n", 3),
         num_trials=_positive_int(hpo_raw, "num_trials", 10),
         time_limit_seconds=_positive_int(hpo_raw, "time_limit_seconds", None),
+        searcher=searcher,
     )
 
 
