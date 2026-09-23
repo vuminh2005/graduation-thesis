@@ -221,6 +221,21 @@ at `num_trials`; it ignores `default`. When a grid is exhausted before
 a traceback in the log; that is expected, not a failure. Both searchers run
 locally without Ray.
 
+*The random searcher's seed follows `training.seed`,* and it is the **same seed
+for every candidate**. So `training.seed` now decides which configurations are
+tried (before, AutoGluon's searcher always used seed 0), re-running with the same
+seed tries the same configurations, and — deliberately — one model on two
+FeatureSets tries *identical* configurations, so comparing the two tuned results
+stays a paired comparison rather than two different random draws. Families with
+different ranges still draw from the same random stream, so their samples are
+correlated too; that is the price of the pairing. With `training.seed: null`
+nothing is passed and AutoGluon's default seed 0 applies, exactly as before.
+`grid` has no seed: it draws nothing at random. The seed is recorded as
+`searcher_seed` (in the tuning manifest's `hpo` block, each tuning `result.json`,
+`selected.json`, the final result and manifest, the registry metadata and
+MLflow) and is part of the tuning signature: changing it makes the tuning
+artifacts stale for `tune` and `finalize`, but not `train`.
+
 **Resource limits.** AutoGluon sizes its memory guard from the host's total RAM,
 so a process capped by a cgroup (`systemd-run -p MemoryMax=8G`, a container)
 would otherwise plan for memory it does not have. MLTool reads the process's
@@ -432,8 +447,13 @@ compute.
 - **Registry** (`.mltool/registry/<n>/`): `register` copies `.mltool/final/`
   (predictor, `preprocessor.pkl`, `feature_plugins/`, `result.json`,
   `manifest.json`) into the next integer version and writes `metadata.json`
-  (timestamp, git commit when available, config fingerprint, selected
-  candidate, best hyperparameters, seeds, test metrics). Versions only grow, so
+  (timestamp, the project directory's git commit when available, config
+  fingerprint, selected candidate, best hyperparameters, seeds, test metrics).
+  `mltool_commit` — here and in the training, tuning and final manifests —
+  records which MLTool build produced the artifact: `{"commit": ..., "dirty": ...}`
+  for the git checkout the running MLTool was imported from (`dirty` = uncommitted
+  changes in its source package), or `null` when MLTool is not running from a git
+  checkout. Versions only grow, so
   registering before each `finalize --force` keeps the history.
 - `status` shows per-phase artifact freshness and the last run of each command,
   `logs [--limit N]` the run history (newest first), and `best` the finalized

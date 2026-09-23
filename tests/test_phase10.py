@@ -167,6 +167,7 @@ def test_space_objects_of_the_right_type_reach_the_fit_call(tmp_path: Path) -> N
     assert params["seed"] == 7
     assert kwargs["hyperparameter_tune_kwargs"] == {
         "num_trials": 4, "scheduler": "local", "searcher": "random",
+        "search_options": {"random_seed": 7},  # the searcher seed follows training.seed
     }
 
 

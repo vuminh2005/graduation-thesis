@@ -18,6 +18,7 @@ from pandas.api.types import is_numeric_dtype
 from mltool.autogluon_adapter import AutoGluonAdapter, AutoGluonError, effective_model_seed
 from mltool.config import MLToolConfig, TrainingConfig
 from mltool.evaluation import EvaluationError, evaluate_predictions
+from mltool.build_info import mltool_commit
 from mltool.resources import resolve_resource_limits
 from mltool.experiment import CandidateSpec, ExperimentPlan, ExperimentError
 
@@ -531,6 +532,7 @@ def train_experiment(
                 for candidate in plan.candidates
             },
             "resource_limits": resolve_resource_limits(plan.config.training).as_record(),
+            "mltool_commit": mltool_commit(),
             "successful_count": succeeded,
             "failed_count": len(candidate_results) - succeeded,
             "leaderboard": {

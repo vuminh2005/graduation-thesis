@@ -34,6 +34,7 @@ from mltool.feature_materialization import (
 )
 from mltool.preprocessing import PreprocessingError, preprocess_frames
 from mltool.splitting import SplitError, should_stratify, split_dataset
+from mltool.build_info import mltool_commit
 from mltool.resources import resolve_resource_limits
 from mltool.training import (
     CORRELATED_FOLDS_NOTE,
@@ -48,6 +49,7 @@ from mltool.training import (
 from mltool.tuning import (
     TuningError,
     hpo_record,
+    recorded_hpo,
     search_space_signature,
     _read_training_artifacts,
     _validate_training_freshness,
@@ -235,7 +237,9 @@ def load_finalize_input(plan: ExperimentPlan) -> FinalizeInput:
     for key, value in _config_signature(config).items():
         if signature[key] != value:
             raise _stale(f'tuning artifacts are stale ("{key}" differs from the current config)', "tune")
-    if config.hpo is None or tuning_manifest.get("hpo") != hpo_record(config.hpo):
+    if config.hpo is None or recorded_hpo(tuning_manifest.get("hpo")) != hpo_record(
+        config.hpo, config.training
+    ):
         raise _stale("tuning artifacts are stale (hpo configuration differs)", "tune")
     if tuning_manifest.get("search_spaces", {}) != search_space_signature(config):
         raise _stale("tuning artifacts are stale (a model's search_space differs)", "tune")
@@ -464,6 +468,7 @@ def finalize_experiment(
             "hpo_warning": selected.get("hpo_warning"),
             "search_space": selected.get("search_space", {}),
             "effective_search_space": selected.get("effective_search_space", {}),
+            "searcher_seed": selected.get("searcher_seed"),
             "fit_hyperparameters": output.best_hyperparameters,
             "seed": config.training.seed,
             "effective_seed": selected.get("effective_seed"),
@@ -516,6 +521,7 @@ def finalize_experiment(
                 "hpo_warning": selected.get("hpo_warning"),
                 "search_space": selected.get("search_space", {}),
                 "effective_search_space": selected.get("effective_search_space", {}),
+                "searcher_seed": selected.get("searcher_seed"),
             },
             "hpo_effective": selected.get("hpo_effective"),
             "hpo_warning": selected.get("hpo_warning"),
@@ -526,6 +532,7 @@ def finalize_experiment(
             "seed": config.training.seed,
             "effective_seed": selected.get("effective_seed"),
             "resource_limits": resolve_resource_limits(config.training).as_record(),
+            "mltool_commit": mltool_commit(),
             "split": {**finalize_input.prepared_manifest["split"]},
             "source_dataset_fingerprint": finalize_input.prepared_manifest["source"][
                 "fingerprint"

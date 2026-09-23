@@ -13,6 +13,7 @@ from typing import Any
 
 from mltool import __version__
 from mltool.config import MLToolConfig
+from mltool.build_info import mltool_commit
 from mltool.finalize import FinalizeError, load_persisted_final
 from mltool.state import utc_now
 from mltool.training import _commit_staged_directory
@@ -130,6 +131,7 @@ def register_final(config: MLToolConfig, *, force: bool = False) -> RegisteredMo
             "registered_at": utc_now(),
             "mltool_version": __version__,
             "git_commit": _git_commit(project_root),
+            "mltool_commit": mltool_commit(),
             "config_fingerprint": config_fingerprint(config),
             "source_dataset_fingerprint": manifest.get("source_dataset_fingerprint"),
             "selected": manifest["selected"],

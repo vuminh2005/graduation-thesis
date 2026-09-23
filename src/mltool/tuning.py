@@ -18,7 +18,10 @@ from mltool.autogluon_adapter import (
     AutoGluonError,
     effective_model_seed,
     effective_search_space,
+    searcher_seed,
+    AUTOGLUON_DEFAULT_SEARCHER_SEED,
 )
+from mltool.build_info import mltool_commit
 from mltool.config import HpoConfig, MLToolConfig, ModelConfig, TrainingConfig
 from mltool.evaluation import EvaluationError, evaluate_predictions
 from mltool.experiment import CandidateSpec, ExperimentPlan, sha256_file
@@ -370,7 +373,7 @@ def is_tunable(model: ModelConfig) -> bool:
     return hpo_not_applicable_warning(model.family, model.search_space) is None
 
 
-def hpo_record(hpo: HpoConfig) -> dict[str, Any]:
+def hpo_record(hpo: HpoConfig, training: TrainingConfig) -> dict[str, Any]:
     """The HPO settings as persisted, and compared, in the tuning manifest."""
     return {
         "top_n": hpo.top_n,
@@ -378,7 +381,17 @@ def hpo_record(hpo: HpoConfig) -> dict[str, Any]:
         "time_limit_seconds": hpo.time_limit_seconds,
         "scheduler": "local",
         "searcher": hpo.searcher,
+        "searcher_seed": searcher_seed(hpo, training),
     }
+
+
+def recorded_hpo(record: Any) -> Any:
+    """A persisted HPO record, with the searcher seed that a record written before
+    it was stored actually used: AutoGluon's default for ``random``, none for grid."""
+    if not isinstance(record, dict) or "searcher_seed" in record:
+        return record
+    default = AUTOGLUON_DEFAULT_SEARCHER_SEED if record.get("searcher") == "random" else None
+    return {**record, "searcher_seed": default}
 
 
 def search_space_signature(config: MLToolConfig) -> dict[str, Any]:
@@ -475,7 +488,7 @@ def _carried_over_result(
         "positive_class": training_result.get("positive_class"),
         "target_conversion_applied": training_result.get("target_conversion_applied"),
         "training_seconds": 0.0,
-        "hpo": hpo_record(config.hpo),
+        "hpo": hpo_record(config.hpo, config.training),
         "seed": training_result.get("seed"),
         "effective_seed": training_result.get("effective_seed"),
         "hpo_effective": False,
@@ -579,7 +592,7 @@ def _tune_candidate(
         "positive_class": output.positive_class,
         "target_conversion_applied": converted,
         "training_seconds": float(time.perf_counter() - started),
-        "hpo": hpo_record(plan.config.hpo),
+        "hpo": hpo_record(plan.config.hpo, plan.config.training),
         "search_space": candidate.model.search_space,
         "effective_search_space": effective_search_space(
             candidate.model, plan.config.task.type
@@ -643,6 +656,7 @@ def build_selected_configuration(
         "hpo_warning": result["hpo_warning"],
         "search_space": result.get("search_space", {}),
         "effective_search_space": result.get("effective_search_space", {}),
+        "searcher_seed": (result.get("hpo") or {}).get("searcher_seed"),
         "seed": result["seed"],
         "effective_seed": result["effective_seed"],
         "primary_metric": primary_metric,
@@ -763,7 +777,8 @@ def tune_experiment(
                 ),
                 _autogluon_version(),
             ),
-            "hpo": hpo_record(config.hpo),
+            "hpo": hpo_record(config.hpo, config.training),
+            "mltool_commit": mltool_commit(),
             "search_spaces": search_space_signature(config),
             "seed": config.training.seed,
             "effective_seed": {
@@ -846,7 +861,7 @@ def load_persisted_tuning(config: MLToolConfig) -> PersistedTuning:
     expected = _config_signature(config)
     hpo_matches = (
         config.hpo is not None
-        and manifest.get("hpo") == hpo_record(config.hpo)
+        and recorded_hpo(manifest.get("hpo")) == hpo_record(config.hpo, config.training)
         and manifest.get("search_spaces", {}) == search_space_signature(config)
     )
     warning = None

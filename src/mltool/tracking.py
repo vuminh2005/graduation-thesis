@@ -195,6 +195,7 @@ def log_tuning(config: MLToolConfig, result_set: Any):
                 "effective_seed": result.get("effective_seed"),
                 "primary_metric": config.evaluation.primary_metric,
                 "searcher": hpo.searcher if hpo else None,
+                "searcher_seed": (result.get("hpo") or {}).get("searcher_seed"),
                 **_flatten("hp", result.get("best_hyperparameters")),
                 **_search_space_params(result),
             }
@@ -245,6 +246,7 @@ def log_final(config: MLToolConfig, final: Any):
             "primary_metric": result["primary_metric"],
             "train_validation_rows": result["rows"]["train_validation"],
             "test_rows": result["rows"]["test"],
+            "searcher_seed": result.get("searcher_seed"),
             **_flatten("hp", result.get("best_hyperparameters")),
             **_search_space_params(result),
         }

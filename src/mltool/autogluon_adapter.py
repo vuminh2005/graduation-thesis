@@ -51,6 +51,23 @@ NO_SEARCH_SPACE_FAMILIES = frozenset({"RF", "XT"})
 # (autogluon/core/scheduler/seq_scheduler.py:128-130).
 AUTOGLUON_SEARCHERS = {"random": "random", "grid": "local_grid"}
 
+# LocalRandomSearcher(random_seed=0) when no seed is passed
+# (autogluon/core/searcher/local_random_searcher.py:22).
+AUTOGLUON_DEFAULT_SEARCHER_SEED = 0
+
+
+def searcher_seed(hpo: HpoConfig, training: TrainingConfig) -> int | None:
+    """The seed of the random searcher: ``training.seed`` itself, identical for
+    every candidate, so one family on two FeatureSets tries the same configurations.
+
+    Without a ``training.seed`` it is AutoGluon's own default (0), as before this
+    setting existed. ``None`` for ``grid``: LocalGridSearcher draws nothing at
+    random (local_grid_searcher.py) and would silently ignore a seed.
+    """
+    if hpo.searcher == "grid":
+        return None
+    return AUTOGLUON_DEFAULT_SEARCHER_SEED if training.seed is None else training.seed
+
 
 def autogluon_spaces(search_space: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """MLTool's normalized specs as ``autogluon.common.space`` objects.
@@ -337,6 +354,14 @@ class AutoGluonAdapter:
                 "scheduler": "local",
                 "searcher": AUTOGLUON_SEARCHERS[hpo.searcher],
             }
+            if hpo.searcher == "random" and training.seed is not None:
+                # Forwarded unchanged to LocalRandomSearcher(random_seed=...):
+                # scheduler_factory.py (scheduler_params.update) -> seq_scheduler.py
+                # get_searcher_ -> searcher_factory. Without a training.seed nothing
+                # is passed, exactly as before.
+                fit_kwargs["hyperparameter_tune_kwargs"]["search_options"] = {
+                    "random_seed": searcher_seed(hpo, training)
+                }
             fit_kwargs["time_limit"] = hpo.time_limit_seconds
         elif training.time_limit_seconds is not None:
             fit_kwargs["time_limit"] = training.time_limit_seconds
