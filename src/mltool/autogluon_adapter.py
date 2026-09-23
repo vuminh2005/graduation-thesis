@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib.metadata import version
 import json
 from pathlib import Path
@@ -205,6 +205,10 @@ class AutoGluonOutput:
     autogluon_version: str
     best_model: str | None = None
     best_hyperparameters: dict[str, Any] | None = None
+    # HPO only: the trials tied on the best validation score (empty = no tie),
+    # and the one AutoGluon itself had picked before MLTool's tie-break.
+    tied_trials: list[str] = field(default_factory=list)
+    autogluon_best_trial: str | None = None
 
 
 def _check_trained_models(trained_models: list[str], family: str) -> None:
@@ -259,6 +263,41 @@ def _check_ensemble_trained_models(trained_models: list[str], families: list[str
             "AutoGluon unexpectedly trained models outside the configured ensemble "
             f'families {sorted(families)}: {", ".join(unrelated)}'
         )
+
+
+TRIAL_NAME = re.compile(r"/T(\d+)$")
+
+
+def break_ties_by_trial_number(predictor: Any) -> tuple[list[str], str]:
+    """Make the lowest-numbered of the trials tied on the best score the best model.
+
+    AutoGluon picks ``max(..., key=(val_score, -predict_time))``
+    (tabular/trainer/abstract_trainer.py, ``get_model_best``), so an exact tie is
+    decided by a wall-clock timing and same-seed runs can disagree. Among trials
+    with exactly the best ``val_score`` (higher is better in AutoGluon), the
+    lowest trial number wins instead, via ``set_model_best(..., save_trainer=True)``
+    (tabular/predictor/predictor.py:4224) so the saved predictor agrees. Returns
+    the tied trial names (empty when there is no tie; nothing is changed then)
+    and AutoGluon's own pick.
+    """
+    autogluon_pick = str(predictor.model_best)
+    model_info = predictor.info()["model_info"]
+    scores = {
+        name: model_info[name].get("val_score")
+        for name in predictor.model_names()
+        if TRIAL_NAME.search(name) and model_info.get(name, {}).get("val_score") is not None
+    }
+    if not scores:
+        return [], autogluon_pick
+    best = max(scores.values())
+    tied = sorted(
+        (name for name, score in scores.items() if score == best),
+        key=lambda name: int(TRIAL_NAME.search(name).group(1)),
+    )
+    if len(tied) < 2:
+        return [], autogluon_pick
+    predictor.set_model_best(tied[0], save_trainer=True)
+    return tied, autogluon_pick
 
 
 def _best_hyperparameters(predictor: Any, model_name: str) -> dict[str, Any]:
@@ -372,6 +411,12 @@ class AutoGluonAdapter:
             # Deliberately no tuning_data: MLTool's validation split remains
             # external and is used only after fitting for cross-candidate metrics.
             predictor.fit(**fit_kwargs)
+            tied_trials: list[str] = []
+            autogluon_best_trial = None
+            if hpo is not None and not is_ensemble:
+                # Before any prediction, so MLTool's validation scores come from
+                # the trial that best_hyperparameters describes.
+                tied_trials, autogluon_best_trial = break_ties_by_trial_number(predictor)
             predictions = predictor.predict(validation_features.copy(deep=True))
             probabilities = None
             if task.type in {"binary", "multiclass"}:
@@ -417,6 +462,8 @@ class AutoGluonAdapter:
             autogluon_version=self._version_resolver(),
             best_model=best_model,
             best_hyperparameters=best_hyperparameters,
+            tied_trials=tied_trials,
+            autogluon_best_trial=autogluon_best_trial,
         )
 
     def fit_final(

@@ -165,11 +165,24 @@ def test_a_different_fold_assignment_refuses_carry_over_before_any_fit(tmp_path:
 
 def test_a_changed_seed_refuses_carry_over(tmp_path: Path) -> None:
     path = trained_project(tmp_path)
-    raw = yaml.safe_load(path.read_text())
+    original = path.read_text()
+    raw = yaml.safe_load(original)
     raw["training"] = {"seed": 99}
     path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    # training freshness now covers training.seed, so selection refuses first
+    with pytest.raises(TuningError, match='"training.seed" differs.*mltool train'):
+        build_tuning_selection(build_experiment_plan(load_config(path)))
+
+    # the carry-over's own per-candidate seed check still guards a result.json
+    # that disagrees with its manifest
+    path.write_text(original, encoding="utf-8")
     plan = build_experiment_plan(load_config(path))
-    selection = build_tuning_selection(plan)  # the config signature has no seed
+    selection = build_tuning_selection(plan)
+    rf = next(c for c in selection.candidates if c.model.family == "RF")
+    result_path = tmp_path / ".mltool/training/candidates" / rf.candidate_id / "result.json"
+    stored = json.loads(result_path.read_text())
+    stored["effective_seed"] = 99
+    result_path.write_text(json.dumps(stored), encoding="utf-8")
     TuningAdapter.calls = []
     with pytest.raises(TuningError, match="used a different seed"):
         tune_experiment(plan, selection, adapter_factory=TuningAdapter)

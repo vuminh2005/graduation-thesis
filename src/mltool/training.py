@@ -621,4 +621,6 @@ def load_persisted_leaderboard(config: MLToolConfig) -> PersistedLeaderboard:
     warning = None
     if training_signature != _config_signature(config):
         warning = "current config differs from the config used to create this leaderboard"
+    elif manifest.get("seed") != config.training.seed:
+        warning = '"training.seed" differs from the seed used to create this leaderboard'
     return PersistedLeaderboard(manifest=manifest, rows=rows, warning=warning)

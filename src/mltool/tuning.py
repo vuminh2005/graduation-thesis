@@ -289,6 +289,10 @@ def _validate_training_freshness(plan: ExperimentPlan, manifest: dict[str, Any])
     for key, value in expected.items():
         if actual[key] != value:
             raise _training_stale(f'"{key}" differs from the current config')
+    # A manifest from before the seed was recorded reads as None: fresh only
+    # when no training.seed is configured either.
+    if manifest.get("seed") != config.training.seed:
+        raise _training_stale('"training.seed" differs from the current config')
     if manifest.get("source_dataset_fingerprint") != plan.feature_manifest.get(
         "source_dataset_fingerprint"
     ):
@@ -506,6 +510,8 @@ def _carried_over_result(
         ),
         "best_model": None,
         "best_hyperparameters": dict(candidate.model.params),
+        "tie_break_applied": False,
+        "tied_trials": [],
         "predictor_path": None,
         "predictor_persisted": False,
         "autogluon_version": training_result.get("autogluon_version"),
@@ -603,6 +609,10 @@ def _tune_candidate(
         "hpo_warning": hpo_warning,
         "best_model": output.best_model,
         "best_hyperparameters": output.best_hyperparameters,
+        # Exact ties on AutoGluon's validation score go to the lowest trial number.
+        "tie_break_applied": bool(output.tied_trials),
+        "tied_trials": list(output.tied_trials),
+        "autogluon_best_trial": output.autogluon_best_trial,
         "predictor_path": str(final_candidate_path / "predictor"),
         "autogluon_version": output.autogluon_version,
         "trained_models": output.trained_models,

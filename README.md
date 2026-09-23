@@ -234,7 +234,19 @@ nothing is passed and AutoGluon's default seed 0 applies, exactly as before.
 `searcher_seed` (in the tuning manifest's `hpo` block, each tuning `result.json`,
 `selected.json`, the final result and manifest, the registry metadata and
 MLflow) and is part of the tuning signature: changing it makes the tuning
-artifacts stale for `tune` and `finalize`, but not `train`.
+artifacts stale for `tune` and `finalize`; since the seed comes from
+`training.seed`, which also seeds every model, such a change makes `train` stale
+as well (training freshness compares `training.seed` with the seed its manifest
+recorded; a manifest from before the seed was recorded counts as `null`).
+
+*Ties between trials are broken by trial number.* AutoGluon picks the trial
+with the best validation score and, on an exact tie, the one that happened to
+predict fastest — a wall-clock measurement, so two runs with the same seed could
+pick different tied trials and hand different `best_hyperparameters` to
+`finalize`. MLTool instead makes the lowest-numbered of the tied trials the best
+model (before scoring it on the validation split), and records
+`tie_break_applied`, `tied_trials` and `autogluon_best_trial` in the tuning
+`result.json`. Without a tie nothing changes.
 
 **Resource limits.** AutoGluon sizes its memory guard from the host's total RAM,
 so a process capped by a cgroup (`systemd-run -p MemoryMax=8G`, a container)

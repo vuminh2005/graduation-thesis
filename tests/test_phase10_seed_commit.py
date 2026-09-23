@@ -17,7 +17,7 @@ from mltool.config import HpoConfig, ModelConfig, TaskConfig, TrainingConfig, lo
 from mltool.experiment import build_experiment_plan
 from mltool.finalize import FinalizeError, load_finalize_input
 from mltool.training import load_persisted_leaderboard
-from mltool.tuning import build_tuning_selection, load_persisted_tuning, recorded_hpo
+from mltool.tuning import TuningError, build_tuning_selection, load_persisted_tuning, recorded_hpo
 from test_audit_fixes import build, edit, fake_adapters  # noqa: F401  (autouse fixture)
 from test_phase4 import FakePredictor
 from test_phase7 import by_phase
@@ -109,14 +109,15 @@ def test_the_searcher_seed_is_recorded_everywhere(tmp_path: Path) -> None:
     assert by_phase(root, "final")[0].data.params["searcher_seed"] == "7"
 
 
-def test_a_seed_change_makes_tune_and_finalize_stale_not_train(tmp_path: Path) -> None:
+def test_a_seed_change_makes_train_tune_and_finalize_stale(tmp_path: Path) -> None:
     path = build(tmp_path, through="tune")
     edit(path, lambda raw: raw["training"].__setitem__("seed", 8))
     config = load_config(path)
-    assert load_persisted_leaderboard(config).warning is None
-    build_tuning_selection(build_experiment_plan(config))
+    assert "training.seed" in load_persisted_leaderboard(config).warning
+    with pytest.raises(TuningError, match='"training.seed" differs.*mltool train'):
+        build_tuning_selection(build_experiment_plan(config))
     assert load_persisted_tuning(config).warning is not None
-    with pytest.raises(FinalizeError, match="hpo configuration differs"):
+    with pytest.raises(FinalizeError, match='"training.seed" differs.*mltool train'):
         load_finalize_input(build_experiment_plan(config))
 
 
