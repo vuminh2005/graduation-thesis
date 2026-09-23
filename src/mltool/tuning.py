@@ -28,6 +28,7 @@ from mltool.cross_validation import (
     cv_score_candidate,
     progress,
 )
+from mltool.resources import resolve_resource_limits
 from mltool.training import (
     TrainingError,
     _autogluon_version,
@@ -128,7 +129,12 @@ class TuningResult:
                 ]
             )
             if result["status"] == "SUCCEEDED":
-                lines.append(f"      trained models (trials): {len(result['trained_models'])}")
+                if result.get("carried_over_from_training"):
+                    lines.append("      carried over from training (not tunable; no fit)")
+                else:
+                    lines.append(
+                        f"      trained models (trials): {len(result['trained_models'])}"
+                    )
                 cv = result.get("cv")
                 std = cv["metric_std"] if cv else None
                 folds = cv["total_fits_per_candidate"] if cv else None
@@ -340,6 +346,126 @@ def tuned_model_config(
     return candidate.model
 
 
+def is_tunable(family: str) -> bool:
+    """GBM/CAT/XGB have an AutoGluon search space; RF/XT and ENSEMBLE do not."""
+    return hpo_not_applicable_warning(family) is None
+
+
+def _read_training_candidate(config: MLToolConfig, candidate: CandidateSpec) -> dict[str, Any]:
+    path = (
+        config.config_path.parent
+        / ".mltool/training/candidates"
+        / candidate.candidate_id
+        / "result.json"
+    )
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise _training_stale(
+            f'the training result of "{candidate.candidate_id}" is missing or unreadable'
+        ) from None
+    if not isinstance(result, dict) or result.get("status") != "SUCCEEDED":
+        raise _training_stale(f'the training result of "{candidate.candidate_id}" is invalid')
+    return result
+
+
+def _validate_carry_over(
+    plan: ExperimentPlan,
+    candidate: CandidateSpec,
+    training_result: dict[str, Any],
+    cv_plan: Any | None,
+) -> None:
+    """A training result may stand in for tuning only if it is what tune would compute.
+
+    ``build_tuning_selection`` has already checked the config signature, the
+    dataset fingerprint and every FeatureSet's bytes against the training
+    manifest; this adds what is specific to reusing one candidate's scores.
+    """
+    config = plan.config
+    cid = candidate.candidate_id
+    if training_result.get("model") != {
+        "name": candidate.model.name,
+        "family": candidate.model.family,
+        "params": candidate.model.params,
+    } or training_result.get("feature_artifacts") != {
+        "train_sha256": candidate.feature_set.train_sha256,
+        "validation_sha256": candidate.feature_set.validation_sha256,
+    }:
+        raise _training_stale(f'the training result of "{cid}" does not match the current plan')
+    if training_result.get("effective_seed") != effective_model_seed(
+        candidate.model, config.training
+    ):
+        raise _training_stale(f'the training result of "{cid}" used a different seed')
+    cv = training_result.get("cv")
+    if cv_plan is None:
+        if cv is not None:
+            raise _training_stale(f'the training result of "{cid}" was cross-validated')
+        return
+    if not isinstance(cv, dict) or not cv.get("fold_metrics"):
+        raise _training_stale(f'the training result of "{cid}" has no per-fold metrics')
+    if cv.get("fold_fingerprint") != cv_plan.fingerprint:
+        raise _training_stale(
+            f'the training result of "{cid}" was scored on a different fold assignment'
+        )
+
+
+def _carried_over_result(
+    plan: ExperimentPlan,
+    candidate: CandidateSpec,
+    training_result: dict[str, Any],
+    phase4_score: float,
+) -> dict[str, Any]:
+    """Tune's result for a candidate it cannot tune: training's, without a fit.
+
+    Tuning such a candidate means fitting the same configuration with the same
+    seed on the same rows, which reproduces training's scores exactly.
+    ``best_hyperparameters`` is the candidate's own configuration, which
+    ``finalize`` refits (seeded) from scratch; for ENSEMBLE that is precisely
+    what a tuning fit used to record.
+    """
+    assert plan.config.hpo is not None
+    config = plan.config
+    cv = training_result.get("cv")
+    return {
+        "candidate_id": candidate.candidate_id,
+        "feature_set": candidate.feature_set.name,
+        "feature_artifacts": training_result["feature_artifacts"],
+        "model": training_result["model"],
+        "task": config.task.type,
+        "primary_metric": config.evaluation.primary_metric,
+        "metrics": training_result["metrics"],
+        **({"cv": cv} if cv is not None else {}),
+        "phase4_primary_score": phase4_score,
+        "positive_class": training_result.get("positive_class"),
+        "target_conversion_applied": training_result.get("target_conversion_applied"),
+        "training_seconds": 0.0,
+        "hpo": {
+            "num_trials": config.hpo.num_trials,
+            "time_limit_seconds": config.hpo.time_limit_seconds,
+            "scheduler": "local",
+            "searcher": "random",
+        },
+        "seed": training_result.get("seed"),
+        "effective_seed": training_result.get("effective_seed"),
+        "hpo_effective": False,
+        "hpo_warning": hpo_not_applicable_warning(candidate.model.family),
+        "carried_over_from_training": True,
+        "training_result": str(
+            config.config_path.parent
+            / ".mltool/training/candidates"
+            / candidate.candidate_id
+            / "result.json"
+        ),
+        "best_model": None,
+        "best_hyperparameters": dict(candidate.model.params),
+        "predictor_path": None,
+        "predictor_persisted": False,
+        "autogluon_version": training_result.get("autogluon_version"),
+        "trained_models": training_result.get("trained_models", []),
+        "status": "SUCCEEDED",
+    }
+
+
 def _tune_candidate(
     plan: ExperimentPlan,
     candidate: CandidateSpec,
@@ -357,10 +483,8 @@ def _tune_candidate(
         plan, candidate
     )
     hpo_warning = hpo_not_applicable_warning(candidate.model.family)
-    # RF/XT still receive hyperparameter_tune_kwargs (AutoGluon just has no search
-    # space to act on, matching Phase 5's original behavior). ENSEMBLE candidates
-    # never combine bagging/stacking with HPO, so they are forced to hpo=None
-    # rather than merely relying on AutoGluon to ignore the kwargs.
+    # Only tunable families reach here; RF/XT and ENSEMBLE are carried over
+    # from training by ``tune_experiment`` without a fit.
     output = adapter.fit_predict(
         train_data=train,
         validation_features=validation_features,
@@ -369,7 +493,7 @@ def _tune_candidate(
         primary_metric=plan.config.evaluation.primary_metric,
         predictor_path=staging_candidate_path / "predictor",
         training=plan.config.training,
-        hpo=None if candidate.model.family == "ENSEMBLE" else plan.config.hpo,
+        hpo=plan.config.hpo,
     )
     metrics = evaluate_predictions(
         task_type=plan.config.task.type,
@@ -514,6 +638,30 @@ def tune_experiment(
     project_root = config.config_path.parent
     workspace = project_root / ".mltool"
     output_path = workspace / "tuning"
+
+    cv_plan = None
+    if config.evaluation.cv is not None:
+        try:
+            cv_plan = build_cv_plan(config)
+        except CrossValidationError as exc:
+            raise TuningError(str(exc)) from exc
+    # Candidates tune cannot tune are validated up front, so a stale training
+    # result fails the command before any tunable candidate spends a fit.
+    carried: dict[str, dict[str, Any]] = {}
+    for candidate in selection.candidates:
+        if not is_tunable(candidate.model.family):
+            training_result = _read_training_candidate(config, candidate)
+            _validate_carry_over(plan, candidate, training_result, cv_plan)
+            carried[candidate.candidate_id] = training_result
+    if carried:
+        progress(
+            "MLTool tune: carried over from training without a fit (not tunable): "
+            + ", ".join(carried)
+        )
+    tunable_count = len(selection.candidates) - len(carried)
+    if cv_plan is not None and tunable_count:
+        progress(cost_warning(tunable_count, cv_plan, "tune"))
+
     try:
         workspace.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=".tuning-staging-", dir=workspace))
@@ -522,14 +670,6 @@ def tune_experiment(
         raise TuningError(f"could not create tuning workspace: {exc}") from exc
 
     adapter_factory = adapter_factory or AutoGluonAdapter
-    cv_plan = None
-    if config.evaluation.cv is not None:
-        try:
-            cv_plan = build_cv_plan(config)
-        except CrossValidationError as exc:
-            shutil.rmtree(staging, ignore_errors=True)
-            raise TuningError(str(exc)) from exc
-        progress(cost_warning(len(selection.candidates), cv_plan, "tune"))
     candidate_results: list[dict[str, Any]] = []
     try:
         # Strictly sequential: one candidate (and one local trial) at a time.
@@ -537,6 +677,13 @@ def tune_experiment(
             staging_candidate = staging / "candidates" / candidate.candidate_id
             final_candidate = output_path / "candidates" / candidate.candidate_id
             staging_candidate.mkdir()
+            if candidate.candidate_id in carried:
+                result = _carried_over_result(
+                    plan, candidate, carried[candidate.candidate_id], row["primary_score"]
+                )
+                _write_json(staging_candidate / "result.json", result)
+                candidate_results.append(result)
+                continue
             try:
                 result = _tune_candidate(
                     plan,
@@ -592,6 +739,7 @@ def tune_experiment(
                 candidate.candidate_id: effective_model_seed(candidate.model, config.training)
                 for candidate in selection.candidates
             },
+            "resource_limits": resolve_resource_limits(config.training).as_record(),
             "training_manifest": str(project_root / ".mltool/training/manifest.json"),
             "training_manifest_sha256": sha256_file(
                 project_root / ".mltool/training/manifest.json"
@@ -606,6 +754,7 @@ def tune_experiment(
                 for artifact in plan.feature_sets
             ],
             "candidate_ids": [candidate.candidate_id for candidate in selection.candidates],
+            "carried_over_candidate_ids": list(carried),
             **({"cv": cv_plan.summary()} if cv_plan is not None else {}),
             "selection_warning": selection.warning,
             "successful_count": succeeded,

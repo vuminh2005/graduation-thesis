@@ -122,9 +122,9 @@ and stack levels) instead of one model — on the ~900-row real-data smoke test
 used to verify this it took roughly 6-10x as long as one single-family
 candidate, still under 9 GB of the machine's ~14 GB RAM. HPO is not applied to
 it: combining bagging/stacking with AutoGluon's hyperparameter search is out of
-scope, so if an ENSEMBLE candidate reaches `tune`'s `top_n`, it is refit with
-its configured ensemble settings and marked `hpo_effective: false`, the same
-`result.json`/`selected.json` convention RF and XT already use for "no search
+scope, so if an ENSEMBLE candidate reaches `tune`'s `top_n`, its training
+result is carried over without a fit and marked `hpo_effective: false`, the
+same `result.json`/`selected.json` convention RF and XT use for "no search
 space". If it wins, `finalize` refits the whole ensemble on train+validation
 and, exactly like a single family, uses `refit_full` to collapse it into one
 `_FULL` predictor trained on every row before the one test evaluation; the
@@ -149,10 +149,36 @@ on its FeatureSet train split with a local, sequential random search
 (`num_trials`, `time_limit_seconds`), and evaluates on the validation split only.
 Bagging, stacking, weighted ensembles, GPUs, and test data stay off. Params you
 fix in a model's `params` stay fixed; the rest of AutoGluon's default search
-space is tuned. Families without a default AutoGluon search space (RF, XT) train once with
-default hyperparameters; `tune` warns about each such candidate and marks it
-`hpo_effective: false` (plus the `hpo_warning` text) in `result.json` and
-`selected.json`.
+space is tuned. Families `tune` cannot tune — RF and XT (no default AutoGluon
+search space) and ENSEMBLE (HPO is not combined with bagging/stacking) — are
+**not fitted at all**: re-fitting the same configuration with the same seed on
+the same rows would only reproduce training's scores, so `tune` copies the
+candidate's training result as-is (holdout metrics, or the per-fold CV metrics
+and fold fingerprint) and marks it `carried_over_from_training: true`,
+`hpo_effective: false`, plus the `hpo_warning` text, in `result.json` and
+`selected.json`; the MLflow tune run is tagged `carried_over=true`. The carry-over
+is refused, before any candidate is fitted, if the training artifacts are stale,
+the seed changed, or (with CV) the fold assignment no longer matches. `finalize`
+still refits the selected configuration from scratch either way.
+
+**Resource limits.** AutoGluon sizes its memory guard from the host's total RAM,
+so a process capped by a cgroup (`systemd-run -p MemoryMax=8G`, a container)
+would otherwise plan for memory it does not have. MLTool reads the process's
+cgroup v2 `memory.max` and `cpu.max` (the tightest value from its own cgroup up
+to the root) and, when one is below the host total, passes it to AutoGluon's
+`fit(memory_limit=..., num_cpus=...)`. Either can be set explicitly instead:
+
+```yaml
+training:
+  memory_limit_gb: null   # GB; null = detect from the cgroup
+  num_cpus: null          # null = detect from the cgroup
+```
+
+The effective limits and where they came from (`config`, `cgroup`, or `null` =
+AutoGluon's own detection) are recorded as `resource_limits` in the training,
+tuning and final manifests. `memory_limit` is a soft limit in AutoGluon. Its
+"System Info" banner is printed before the limit is applied, so the first
+banner in a run still shows the host total; the fits themselves use the cap.
 
 Output goes to `.mltool/tuning/` (`candidates/`, `leaderboard.json/csv`,
 `manifest.json`, and `selected.json`, the best tuned configuration for a later
@@ -185,7 +211,7 @@ Absent, everything behaves exactly as before. With it:
   scoring, because their plugins saw the whole train split.
 - The test rows are never part of the development set, so `train` and `tune`
   still record `test_data_used: false`.
-- `train` ranks by the CV mean and shows `mean +/- std (n folds)`; per-fold
+- `train` ranks by the CV mean and shows `mean (fold sd s, n folds)`; per-fold
   metrics are persisted in each candidate's `result.json`. Fold predictors are
   scratch and are not persisted (nothing downstream loads a training predictor),
   so a cross-validated `result.json` has `predictor_path: null` and
@@ -194,7 +220,8 @@ Absent, everything behaves exactly as before. With it:
   search on the train split), then re-scores the winning configuration across
   the same folds with its hyperparameters **fixed**; that CV mean is what the
   tuned leaderboard and `selected.json` report. Families HPO does not tune
-  (RF, XT, ENSEMBLE) are cross-validated as configured. Note the mild optimism
+  (RF, XT, ENSEMBLE) are carried over from training — same folds, same scores,
+  no fit. Note the mild optimism
   this leaves: the hyperparameters were searched on rows that also appear in the
   CV training folds, so a tuned CV mean is not a fully unbiased estimate. Nested
   cross-validation is out of scope.

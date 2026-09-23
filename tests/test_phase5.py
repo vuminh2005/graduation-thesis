@@ -216,7 +216,8 @@ def test_tune_persists_artifacts_selects_best_and_never_reads_test(
     TuningAdapter.failures = set()
     result = tune_experiment(plan, selection, adapter_factory=TuningAdapter)
 
-    assert len(TuningAdapter.calls) == 2  # top_n
+    # top_n is 2, but the RF candidate has no search space: carried over, not fitted
+    assert len(TuningAdapter.calls) == 1
     for call in TuningAdapter.calls:
         assert call["hpo"] == HpoConfig(2, 4, 30)
         assert "test" not in str(call["predictor_path"].name)
@@ -227,6 +228,10 @@ def test_tune_persists_artifacts_selects_best_and_never_reads_test(
     for candidate in selection.candidates:
         candidate_dir = out / "candidates" / candidate.candidate_id
         stored = json.loads((candidate_dir / "result.json").read_text())
+        if candidate.model.family == "RF":
+            assert stored["carried_over_from_training"] is True
+            assert stored["predictor_path"] is None
+            continue
         assert stored["best_hyperparameters"]["learning_rate"] == 0.05
         assert stored["hpo"]["num_trials"] == 4
         assert (candidate_dir / "predictor/fake.txt").is_file()
@@ -276,8 +281,9 @@ def test_failed_tuning_candidate_is_recorded_and_others_continue(tmp_path: Path)
     assert result.selected and result.selected["candidate_id"] == selection.candidates[1].candidate_id
     TuningAdapter.failures = {c.model.name for c in selection.candidates}
     result = tune_experiment(plan, selection, adapter_factory=TuningAdapter)
-    assert not result.is_successful and result.selected is None
-    assert not (tmp_path / ".mltool/tuning/selected.json").exists()
+    # the RF candidate is carried over without a fit, so it cannot fail
+    assert [r["status"] for r in result.candidate_results] == ["FAILED", "SUCCEEDED"]
+    assert result.selected["candidate_id"] == selection.candidates[1].candidate_id
 
 
 def test_rerun_replaces_tuning_directory_atomically(tmp_path: Path) -> None:

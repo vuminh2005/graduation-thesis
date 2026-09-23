@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import math
 from pathlib import Path
 import re
 from typing import Any
@@ -154,6 +155,9 @@ class EvaluationConfig:
 class TrainingConfig:
     time_limit_seconds: int | None = None
     seed: int | None = None
+    # null = detect from the process's cgroup (see mltool.resources)
+    memory_limit_gb: float | None = None
+    num_cpus: int | None = None
 
 
 @dataclass(frozen=True)
@@ -372,7 +376,11 @@ def _training_config(raw: dict[str, Any]) -> TrainingConfig:
     training_raw = raw.get("training", {})
     if not isinstance(training_raw, dict):
         raise ConfigError('configuration section "training" must be a mapping')
-    _reject_unknown(training_raw, {"time_limit_seconds", "seed"}, "training")
+    _reject_unknown(
+        training_raw,
+        {"time_limit_seconds", "seed", "memory_limit_gb", "num_cpus"},
+        "training",
+    )
     time_limit = training_raw.get("time_limit_seconds")
     if time_limit is not None and (
         isinstance(time_limit, bool) or not isinstance(time_limit, int) or time_limit <= 0
@@ -383,7 +391,25 @@ def _training_config(raw: dict[str, Any]) -> TrainingConfig:
         isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**31
     ):
         raise ConfigError('"training.seed" must be null or an integer in [0, 2**31)')
-    return TrainingConfig(time_limit_seconds=time_limit, seed=seed)
+    memory_limit_gb = training_raw.get("memory_limit_gb")
+    if memory_limit_gb is not None and (
+        isinstance(memory_limit_gb, bool)
+        or not isinstance(memory_limit_gb, (int, float))
+        or not math.isfinite(memory_limit_gb)
+        or memory_limit_gb <= 0
+    ):
+        raise ConfigError('"training.memory_limit_gb" must be null or a positive number')
+    num_cpus = training_raw.get("num_cpus")
+    if num_cpus is not None and (
+        isinstance(num_cpus, bool) or not isinstance(num_cpus, int) or num_cpus <= 0
+    ):
+        raise ConfigError('"training.num_cpus" must be null or a positive integer')
+    return TrainingConfig(
+        time_limit_seconds=time_limit,
+        seed=seed,
+        memory_limit_gb=None if memory_limit_gb is None else float(memory_limit_gb),
+        num_cpus=num_cpus,
+    )
 
 
 def _positive_int(parent: dict[str, Any], key: str, default: int | None) -> int:

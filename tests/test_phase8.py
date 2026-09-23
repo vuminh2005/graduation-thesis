@@ -535,7 +535,7 @@ def test_train_leaderboard_includes_ensemble_as_a_candidate(tmp_path: Path) -> N
     assert "WeightedEnsemble_L2" in result["trained_models"]
 
 
-def test_tune_refits_ensemble_without_hpo_and_flags_it(tmp_path: Path) -> None:
+def test_tune_carries_ensemble_over_without_a_fit_and_flags_it(tmp_path: Path) -> None:
     path = ensemble_project(tmp_path)
     run_train(path)
     plan = build_experiment_plan(load_config(path))
@@ -544,14 +544,12 @@ def test_tune_refits_ensemble_without_hpo_and_flags_it(tmp_path: Path) -> None:
     EnsembleAwareAdapter.calls = []
     result = tune_experiment(plan, selection, adapter_factory=EnsembleAwareAdapter)
     assert result.is_successful
-    ensemble_call = next(
-        c for c in EnsembleAwareAdapter.calls if c["model"].family == "ENSEMBLE"
-    )
-    assert ensemble_call["hpo"] is None  # forced off despite plan.config.hpo being set
+    assert not any(c["model"].family == "ENSEMBLE" for c in EnsembleAwareAdapter.calls)
     ensemble_row = next(
         r for r in result.candidate_results if r["model"]["family"] == "ENSEMBLE"
     )
     assert ensemble_row["hpo_effective"] is False
+    assert ensemble_row["carried_over_from_training"] is True
     assert ensemble_row["hpo_warning"] == ensemble_hpo_not_applied_warning()
     assert "ENSEMBLE" in ensemble_row["hpo_warning"] or "ensemble" in ensemble_row["hpo_warning"]
     assert ensemble_row["best_hyperparameters"] == {
@@ -562,17 +560,16 @@ def test_tune_refits_ensemble_without_hpo_and_flags_it(tmp_path: Path) -> None:
     assert hpo_not_applicable_warning("GBM") is None
 
 
-def test_rf_hpo_call_is_unaffected_by_ensemble_support(tmp_path: Path) -> None:
-    """The dispatch that forces hpo=None for ENSEMBLE must not touch RF/XT."""
+def test_rf_and_ensemble_make_no_tune_fit(tmp_path: Path) -> None:
+    """Neither RF (no search space) nor ENSEMBLE (no HPO) is fitted by tune."""
     path = ensemble_project(tmp_path, models=[RF, ensemble_model()])
     run_train(path)
     plan = build_experiment_plan(load_config(path))
     selection = build_tuning_selection(plan)
     EnsembleAwareAdapter.calls = []
-    tune_experiment(plan, selection, adapter_factory=EnsembleAwareAdapter)
-    rf_call = next(c for c in EnsembleAwareAdapter.calls if c["model"].family == "RF")
-    assert rf_call["hpo"] is not None  # unchanged: RF still receives the hpo kwargs object
-    assert rf_call["hpo"].num_trials == plan.config.hpo.num_trials
+    result = tune_experiment(plan, selection, adapter_factory=EnsembleAwareAdapter)
+    assert EnsembleAwareAdapter.calls == []
+    assert all(r["carried_over_from_training"] for r in result.candidate_results)
 
 
 def finalize_ensemble(path: Path) -> Any:

@@ -215,7 +215,7 @@ def test_tune_creates_one_run_per_tuned_candidate(tmp_path: Path) -> None:
     project(tmp_path, through="tune")
     runs = by_phase(tmp_path, "tune")
     assert len(runs) == 2
-    run = runs[0]
+    run = next(r for r in runs if r.data.params["model_family"] == "GBM")  # RF is carried over
     assert run.data.params["num_trials"] == "4" and run.data.params["top_n"] == "2"
     assert run.data.params["hpo_time_limit_seconds"] == "30"
     assert run.data.params["hp.learning_rate"] == "0.05"  # best_hyperparameters, flattened

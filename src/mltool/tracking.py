@@ -185,6 +185,7 @@ def log_tuning(config: MLToolConfig, result_set: Any):
                 "candidate_id": result["candidate_id"],
                 "status": result["status"],
                 "hpo_effective": str(result.get("hpo_effective")).lower(),
+                "carried_over": str(bool(result.get("carried_over_from_training"))).lower(),
             }
             if failed:
                 tags["error_message"] = result.get("error_message", "")

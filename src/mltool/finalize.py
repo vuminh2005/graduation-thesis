@@ -34,6 +34,7 @@ from mltool.feature_materialization import (
 )
 from mltool.preprocessing import PreprocessingError, preprocess_frames
 from mltool.splitting import SplitError, should_stratify, split_dataset
+from mltool.resources import resolve_resource_limits
 from mltool.training import (
     CORRELATED_FOLDS_NOTE,
     TrainingError,
@@ -522,6 +523,7 @@ def finalize_experiment(
             "feature_sets": [{"name": a.name} for a in plan.feature_sets],
             "seed": config.training.seed,
             "effective_seed": selected.get("effective_seed"),
+            "resource_limits": resolve_resource_limits(config.training).as_record(),
             "split": {**finalize_input.prepared_manifest["split"]},
             "source_dataset_fingerprint": finalize_input.prepared_manifest["source"][
                 "fingerprint"

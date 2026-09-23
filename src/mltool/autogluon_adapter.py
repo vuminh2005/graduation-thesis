@@ -11,6 +11,7 @@ from typing import Any, Callable
 import pandas as pd
 
 from mltool.config import HpoConfig, ModelConfig, TaskConfig, TrainingConfig
+from mltool.resources import resolve_resource_limits
 
 
 AUTOGLUON_METRICS = {
@@ -242,6 +243,7 @@ class AutoGluonAdapter:
             fit_kwargs["time_limit"] = hpo.time_limit_seconds
         elif training.time_limit_seconds is not None:
             fit_kwargs["time_limit"] = training.time_limit_seconds
+        fit_kwargs.update(resolve_resource_limits(training).fit_kwargs())
 
         try:
             predictor = self._factory()(**predictor_kwargs)
@@ -362,6 +364,7 @@ class AutoGluonAdapter:
             fit_kwargs["ag_args_ensemble"] = {"fold_fitting_strategy": "sequential_local"}
         if training.time_limit_seconds is not None:
             fit_kwargs["time_limit"] = training.time_limit_seconds
+        fit_kwargs.update(resolve_resource_limits(training).fit_kwargs())
 
         try:
             predictor = self._factory()(**predictor_kwargs)
