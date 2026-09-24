@@ -271,6 +271,60 @@ Output goes to `.mltool/tuning/` (`candidates/`, `leaderboard.json/csv`,
 `manifest.json`, and `selected.json`, the best tuned configuration for a later
 final refit). `tuning-leaderboard` is read-only.
 
+**Custom models (Phase 11): `family: SKLEARN`.** Any sklearn-compatible
+estimator you write can be a candidate, without learning AutoGluon's internals:
+
+```yaml
+models:
+  - name: svc
+    family: SKLEARN
+    entrypoint: ./models.py:make_svc   # class or function; path relative to mltool.yaml
+    input: auto                        # auto (default) | raw
+    params: {kernel: rbf, probability: true}
+    search_space:
+      C: {type: real, low: 0.001, high: 100, log: true}
+```
+
+- **Contract.** MLTool calls the entrypoint with `params` (plus, while tuning,
+  the sampled `search_space` values) and needs back an object with `fit(X, y)`
+  and `predict(X)`, and for classification `predict_proba(X)`. `plan` (and every
+  command after it) builds one instance — `params` plus each range's first value —
+  and fails with a config error if a method is missing, e.g. an `SVC` without
+  `probability: true`. Keys starting with `mltool_` are reserved.
+- **`input: auto`** gives the estimator a numeric matrix built from AutoGluon's
+  processed features, with statistics learned only from the rows the model is fit
+  on (each CV fold, the train split, or train+validation at `finalize`): numeric
+  columns median-imputed then standard-scaled; categorical columns filled with
+  their most frequent value and one-hot encoded with the categories seen in fit
+  (an unseen category is all zeros). **`input: raw`** passes AutoGluon's processed
+  DataFrame unchanged (categoricals as `category` dtype, missing values as NaN),
+  for a full sklearn `Pipeline` that does its own preprocessing.
+- **Seed.** If the estimator's `get_params()` has a top-level `random_state` and
+  `params` does not fix it, MLTool sets it to `training.seed` with
+  `set_params`; otherwise the effective seed is `null` and a `seed_note` says why.
+  Estimators nested inside yours (AdaBoost's base tree, a Pipeline step) are **not**
+  seeded by MLTool — set their `random_state` yourself.
+- **Tuning** happens only when a `search_space` is declared; otherwise the
+  candidate is carried over from training like RF/XT. Search spaces, the searcher
+  seed, the trial tie-break, CV scoring and staleness work as for other families.
+  SKLEARN models cannot be ENSEMBLE members.
+- **Time limits cannot stop an sklearn fit**: AutoGluon passes the time limit to
+  the model, but a running `fit` cannot be interrupted, so a slow estimator
+  overruns `training.time_limit_seconds` / `hpo.time_limit_seconds`.
+- **Final model.** Every SKLEARN candidate is one AutoGluon model,
+  `MLToolSklearn` (trials `MLToolSklearn/T<n>`); `finalize` retrains it on all
+  train+validation rows as `MLToolSklearn_FULL`, like any other family.
+- **Persistence.** The saved predictor in `.mltool/final/` and every registry
+  version loads and predicts in a fresh Python process that has MLTool installed
+  but never reads your model file: AutoGluon saves models with plain pickle, which
+  would store your classes by reference, so MLTool's wrapper stores the fitted
+  estimator with cloudpickle, which stores code from your file by value. Keep the
+  model self-contained in the entrypoint file plus installed packages — a sibling
+  module it imports is neither saved by value nor tracked for staleness.
+- **Staleness.** The entrypoint, the input mode and a SHA-256 of the entrypoint
+  file are part of the model's record in every artifact, so editing the file (or
+  switching `input`) makes `train`, `tune`, `finalize` and the final model stale.
+
 **Cross-validated evaluation.** A single validation holdout is small: on the
 891-row Titanic set it is 134 rows, and differences between FeatureSets on it
 are mostly noise. Adding an optional `evaluation.cv` section scores every

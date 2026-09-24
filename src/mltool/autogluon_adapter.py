@@ -33,6 +33,9 @@ FAMILY_MODEL_TOKENS = {
     "RF": ("RandomForest",),
     "XT": ("ExtraTrees",),
 }
+# SKLEARN candidates train exactly MLTool's wrapper: the model, its HPO trials,
+# and the refit_full copy (mltool.autogluon_sklearn.AG_NAME is "MLToolSklearn").
+SKLEARN_MODEL_NAME = re.compile(r"^MLToolSklearn(/T\d+)?(_FULL)?$")
 
 
 # AutoGluon 1.6 has no seed argument on TabularPredictor.fit. Reproducibility is
@@ -43,7 +46,8 @@ FAMILY_MODEL_TOKENS = {
 
 # Families for which AutoGluon defines no default hyperparameter search space:
 # with hyperparameter_tune_kwargs they train a single default model.
-NO_SEARCH_SPACE_FAMILIES = frozenset({"RF", "XT"})
+# SKLEARN has no search space unless the user declares one, like RF/XT.
+NO_SEARCH_SPACE_FAMILIES = frozenset({"RF", "XT", "SKLEARN"})
 
 # MLTool's hpo.searcher -> the installed AutoGluon's local (Ray-free) searcher
 # (autogluon/core/searcher/searcher_factory.py:6-13). "random" is kept verbatim:
@@ -172,6 +176,10 @@ def effective_model_seed(model: ModelConfig, training: TrainingConfig) -> Any | 
     """
     if model.family == "ENSEMBLE":
         return training.seed
+    if model.family == "SKLEARN":
+        from mltool.custom_models import seed_decision
+
+        return seed_decision(model, training)[0]
     params = dict(model.params)
     if training.seed is not None:
         params.setdefault(FAMILY_SEED_KEYS[model.family], training.seed)
@@ -216,6 +224,13 @@ def _check_trained_models(trained_models: list[str], family: str) -> None:
         raise AutoGluonError("AutoGluon did not train a usable model")
     if any("WeightedEnsemble" in name for name in trained_models):
         raise AutoGluonError("AutoGluon unexpectedly trained a weighted ensemble")
+    if family == "SKLEARN":
+        unrelated = [name for name in trained_models if not SKLEARN_MODEL_NAME.fullmatch(name)]
+        if unrelated:
+            raise AutoGluonError(
+                f'AutoGluon unexpectedly trained models outside family SKLEARN: {", ".join(unrelated)}'
+            )
+        return
     expected_tokens = FAMILY_MODEL_TOKENS[family]
     unrelated = [
         name for name in trained_models if not any(token in name for token in expected_tokens)
@@ -300,9 +315,25 @@ def break_ties_by_trial_number(predictor: Any) -> tuple[list[str], str]:
     return tied, autogluon_pick
 
 
+def sklearn_hyperparameters(
+    model: ModelConfig, params: dict[str, Any], seed: Any | None
+) -> dict[Any, dict[str, Any]]:
+    """``{MLToolSklearnModel: ...}``: the estimator's params plus the wrapper's
+    private keys (the entrypoint to build it from, the input mode, and the seed
+    MLTool sets through ``set_params(random_state=...)`` when it sets one)."""
+    from mltool.autogluon_sklearn import MLToolSklearnModel
+    from mltool.custom_models import ENTRYPOINT_KEY, INPUT_KEY, RANDOM_STATE_KEY, entrypoint_spec
+
+    wrapper = {**params, ENTRYPOINT_KEY: entrypoint_spec(model), INPUT_KEY: model.input}
+    if seed is not None and "random_state" not in params:
+        wrapper[RANDOM_STATE_KEY] = seed
+    return {MLToolSklearnModel: wrapper}
+
+
 def _best_hyperparameters(predictor: Any, model_name: str) -> dict[str, Any]:
     info = predictor.info()["model_info"][model_name]
-    return dict(info.get("hyperparameters", {}))
+    # the SKLEARN wrapper's own keys describe how it runs, not the estimator
+    return {k: v for k, v in info.get("hyperparameters", {}).items() if not k.startswith("mltool_")}
 
 
 class AutoGluonAdapter:
@@ -354,6 +385,11 @@ class AutoGluonAdapter:
 
         if is_ensemble:
             hyperparameters = _ensemble_hyperparameters(model.params["families"], training.seed)
+        elif model.family == "SKLEARN":
+            spaces = autogluon_spaces(model.search_space) if hpo is not None else {}
+            hyperparameters = sklearn_hyperparameters(
+                model, {**model.params, **spaces}, effective_model_seed(model, training)
+            )
         else:
             model_params = dict(model.params)
             if training.seed is not None:
@@ -507,6 +543,11 @@ class AutoGluonAdapter:
                 best_hyperparameters["families"], effective_seed
             )
             resolved_hyperparameters = hyperparameters
+        elif model.family == "SKLEARN":
+            hyperparameters = sklearn_hyperparameters(model, dict(best_hyperparameters), effective_seed)
+            resolved_hyperparameters = dict(best_hyperparameters)
+            if effective_seed is not None and "random_state" not in resolved_hyperparameters:
+                resolved_hyperparameters["random_state"] = effective_seed  # via set_params
         else:
             params = dict(best_hyperparameters)
             if effective_seed is not None:

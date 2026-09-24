@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -18,7 +19,9 @@ SUPPORTED_FORMATS = {"auto", "csv", "parquet"}
 SINGLE_MODEL_FAMILIES = {"GBM", "CAT", "XGB", "RF", "XT"}
 # Phase 8 adds ENSEMBLE: several of the families above, bagged/stacked/weighted
 # by AutoGluon itself, as one more candidate in the FeatureSet x model matrix.
-SUPPORTED_MODEL_FAMILIES = SINGLE_MODEL_FAMILIES | {"ENSEMBLE"}
+# Phase 11 adds SKLEARN: a user's sklearn-compatible estimator (never an ENSEMBLE member).
+SUPPORTED_MODEL_FAMILIES = SINGLE_MODEL_FAMILIES | {"ENSEMBLE", "SKLEARN"}
+SKLEARN_INPUT_MODES = ("auto", "raw")
 # families defaults to all five single families, in this documented order.
 DEFAULT_ENSEMBLE_FAMILIES = ["GBM", "CAT", "XGB", "RF", "XT"]
 SUPPORTED_METRICS = {
@@ -49,6 +52,8 @@ FAMILY_SEED_KEYS = {
     "XGB": "seed",
     "RF": "random_state",
     "XT": "random_state",
+    # SKLEARN: only when the user's estimator has a top-level random_state.
+    "SKLEARN": "random_state",
 }
 # Local (Ray-free) searchers of the installed AutoGluon; "grid" is its local_grid.
 SUPPORTED_SEARCHERS = ("random", "grid")
@@ -135,6 +140,34 @@ class ModelConfig:
     # Normalized specs, e.g. {"learning_rate": {"type": "real", "low": 0.005,
     # "high": 0.2, "log": True}}; used by ``tune`` only, never by ``train``.
     search_space: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # SKLEARN only: "<file>:<attribute>" as written, the resolved file, the input mode.
+    entrypoint: str | None = None
+    source_path: Path | None = None
+    input: str | None = None
+
+
+def source_sha256(path: Path | None) -> str | None:
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest() if path else None
+    except OSError:
+        return None
+
+
+def model_record(model: ModelConfig) -> dict[str, Any]:
+    """A model as persisted in every artifact and compared by every staleness check.
+
+    For SKLEARN it also carries the entrypoint, the input mode and the hash of the
+    entrypoint file, so editing the user's model file makes the artifacts stale.
+    Other families keep exactly the three keys they always had.
+    """
+    record: dict[str, Any] = {"name": model.name, "family": model.family, "params": model.params}
+    if model.family == "SKLEARN":
+        record.update(
+            entrypoint=model.entrypoint,
+            input=model.input,
+            source_sha256=source_sha256(model.source_path),
+        )
+    return record
 
 
 @dataclass(frozen=True)
@@ -264,6 +297,11 @@ def _ensemble_params(params_raw: dict[str, Any], prefix: str) -> dict[str, Any]:
         raise ConfigError(f'"{prefix}.params.families" must be a list of strings')
     if len(families) != len(set(families)):
         raise ConfigError(f'"{prefix}.params.families" must contain unique values')
+    if "SKLEARN" in families:
+        raise ConfigError(
+            f'"{prefix}.params.families" contains SKLEARN; custom SKLEARN models cannot be '
+            "ENSEMBLE members"
+        )
     unsupported = [family for family in families if family not in SINGLE_MODEL_FAMILIES]
     if unsupported:
         supported = ", ".join(sorted(SINGLE_MODEL_FAMILIES))
@@ -389,7 +427,21 @@ def _search_space(
     return {key: _search_space_entry(spec, f"{where}.{key}") for key, spec in raw.items()}
 
 
-def _model_config(raw: dict[str, Any]) -> list[ModelConfig]:
+def _sklearn_entrypoint(model_raw: dict[str, Any], prefix: str, config_dir: Path) -> tuple[str, Path]:
+    entrypoint = model_raw.get("entrypoint")
+    if not isinstance(entrypoint, str) or not entrypoint.strip():
+        raise ConfigError(f'"{prefix}.entrypoint" is required for SKLEARN: "<python-file>:<name>"')
+    file_text, separator, attribute = entrypoint.strip().rpartition(":")
+    if not separator or not file_text.strip() or not attribute.strip().isidentifier():
+        raise ConfigError(f'"{prefix}.entrypoint" must be "<python-file>:<class-or-function>"')
+    path = Path(file_text.strip()).expanduser()
+    path = (path if path.is_absolute() else config_dir / path).resolve()
+    if not path.is_file():
+        raise ConfigError(f'"{prefix}.entrypoint" file not found: {path}')
+    return entrypoint.strip(), path
+
+
+def _model_config(raw: dict[str, Any], config_dir: Path) -> list[ModelConfig]:
     models_raw = raw.get("models", [])
     if not isinstance(models_raw, list):
         raise ConfigError('"models" must be a list')
@@ -399,7 +451,10 @@ def _model_config(raw: dict[str, Any]) -> list[ModelConfig]:
         prefix = f"models[{index}]"
         if not isinstance(model_raw, dict):
             raise ConfigError(f'"{prefix}" must be a mapping')
-        _reject_unknown(model_raw, {"name", "family", "params", "search_space"}, prefix)
+        allowed = {"name", "family", "params", "search_space"}
+        if model_raw.get("family") == "SKLEARN":
+            allowed |= {"entrypoint", "input"}
+        _reject_unknown(model_raw, allowed, prefix)
         name = _non_empty_string(model_raw, "name", f"{prefix}.name")
         if not SAFE_IDENTIFIER.fullmatch(name):
             raise ConfigError(
@@ -422,8 +477,20 @@ def _model_config(raw: dict[str, Any]) -> list[ModelConfig]:
         else:
             params = _json_mapping(params_raw, f"{prefix}.params")
         search_space = _search_space(model_raw.get("search_space"), prefix, family, params)
+        entrypoint = source_path = input_mode = None
+        if family == "SKLEARN":
+            entrypoint, source_path = _sklearn_entrypoint(model_raw, prefix, config_dir)
+            input_mode = model_raw.get("input", "auto")
+            if input_mode not in SKLEARN_INPUT_MODES:
+                raise ConfigError(f'"{prefix}.input" must be one of: {", ".join(SKLEARN_INPUT_MODES)}')
+            reserved = sorted(k for k in [*params, *search_space] if k.startswith("mltool_"))
+            if reserved:
+                raise ConfigError(f'"{prefix}": keys starting with "mltool_" are reserved: {reserved}')
         models.append(
-            ModelConfig(name=name, family=family, params=params, search_space=search_space)
+            ModelConfig(
+                name=name, family=family, params=params, search_space=search_space,
+                entrypoint=entrypoint, source_path=source_path, input=input_mode,
+            )
         )
     return models
 
@@ -808,7 +875,7 @@ def load_config(path: Path | str = Path("mltool.yaml")) -> MLToolConfig:
         )
     )
     features = _feature_config(raw)
-    models = _model_config(raw)
+    models = _model_config(raw, config_path.parent)
     evaluation = _evaluation_config(raw, task_type)
     training = _training_config(raw)
     hpo = _hpo_config(raw)

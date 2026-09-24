@@ -16,7 +16,8 @@ import pandas as pd
 from pandas.api.types import is_numeric_dtype
 
 from mltool.autogluon_adapter import AutoGluonAdapter, AutoGluonError, effective_model_seed
-from mltool.config import MLToolConfig, TrainingConfig
+from mltool.custom_models import seed_note_record
+from mltool.config import MLToolConfig, TrainingConfig, model_record
 from mltool.evaluation import EvaluationError, evaluate_predictions
 from mltool.build_info import mltool_commit
 from mltool.resources import resolve_resource_limits
@@ -240,11 +241,7 @@ def _candidate_failure(
             "train_sha256": candidate.feature_set.train_sha256,
             "validation_sha256": candidate.feature_set.validation_sha256,
         },
-        "model": {
-            "name": candidate.model.name,
-            "family": candidate.model.family,
-            "params": candidate.model.params,
-        },
+        "model": model_record(candidate.model),
         "status": "FAILED",
         "error_message": message,
     }
@@ -280,17 +277,14 @@ def _cv_train_candidate(
             "train_sha256": candidate.feature_set.train_sha256,
             "validation_sha256": candidate.feature_set.validation_sha256,
         },
-        "model": {
-            "name": candidate.model.name,
-            "family": candidate.model.family,
-            "params": candidate.model.params,
-        },
+        "model": model_record(candidate.model),
         "task": config.task.type,
         "primary_metric": config.evaluation.primary_metric,
         "metrics": score.metrics,
         "cv": score.as_record(cv_plan),
         "seed": config.training.seed,
         "effective_seed": effective_model_seed(candidate.model, config.training),
+        **seed_note_record(candidate.model, config.training),
         "positive_class": score.positive_class,
         "target_conversion_applied": score.target_conversion_applied,
         "training_seconds": float(time.perf_counter() - started),
@@ -341,16 +335,13 @@ def _train_candidate(
             "train_sha256": candidate.feature_set.train_sha256,
             "validation_sha256": candidate.feature_set.validation_sha256,
         },
-        "model": {
-            "name": candidate.model.name,
-            "family": candidate.model.family,
-            "params": candidate.model.params,
-        },
+        "model": model_record(candidate.model),
         "task": plan.config.task.type,
         "primary_metric": plan.config.evaluation.primary_metric,
         "metrics": metrics,
         "seed": plan.config.training.seed,
         "effective_seed": effective_model_seed(candidate.model, plan.config.training),
+        **seed_note_record(candidate.model, plan.config.training),
         "positive_class": output.positive_class,
         "target_conversion_applied": converted,
         "training_seconds": float(time.perf_counter() - started),
@@ -519,7 +510,7 @@ def train_experiment(
                 for artifact in plan.feature_sets
             ],
             "models": [
-                {"name": model.name, "family": model.family, "params": model.params}
+                model_record(model)
                 for model in plan.config.models
             ],
             "candidate_ids": [candidate.candidate_id for candidate in plan.candidates],
@@ -579,7 +570,7 @@ def _config_signature(config: MLToolConfig) -> dict[str, Any]:
         "cv": cv_signature(config),
         "feature_sets": [feature_set.name for feature_set in config.features.sets],
         "models": [
-            {"name": model.name, "family": model.family, "params": model.params}
+            model_record(model)
             for model in config.models
         ],
     }

@@ -371,6 +371,13 @@ def build_experiment_plan(config: MLToolConfig) -> ExperimentPlan:
         raise ExperimentError(
             'no models are configured; add a non-empty "models" list to mltool.yaml'
         )
+    for model in config.models:
+        if model.family == "SKLEARN":
+            # Build one instance now, so a contract violation (e.g. an SVC
+            # without probability=True) is a config error before any fit.
+            from mltool.custom_models import validate
+
+            validate(model, config.task.type)
     manifest_path, manifest, feature_sets = load_feature_artifacts(config)
     candidates = [
         CandidateSpec(

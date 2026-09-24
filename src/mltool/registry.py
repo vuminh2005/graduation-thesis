@@ -140,6 +140,7 @@ def register_final(config: MLToolConfig, *, force: bool = False) -> RegisteredMo
             "hpo_warning": result.get("hpo_warning"),
             "seed": result.get("seed"),
             "effective_seed": result.get("effective_seed"),
+            **({"seed_note": result["seed_note"]} if "seed_note" in result else {}),
             "primary_metric": result["primary_metric"],
             "test_metrics": result["metrics"],
             "selected_validation_score": result["selected_validation_score"],

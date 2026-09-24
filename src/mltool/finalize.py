@@ -14,7 +14,7 @@ import cloudpickle
 import pandas as pd
 
 from mltool.autogluon_adapter import AutoGluonAdapter, AutoGluonError
-from mltool.config import MLToolConfig
+from mltool.config import MLToolConfig, model_record
 from mltool.data import DataLoadError, load_dataset
 from mltool.feature_plugins import FeaturePluginError
 from mltool.evaluation import EvaluationError, evaluate_predictions
@@ -257,11 +257,7 @@ def load_finalize_input(plan: ExperimentPlan) -> FinalizeInput:
     )
     if candidate is None:
         raise _stale("selected candidate is not in the current plan", "tune")
-    if selected.get("model") != {
-        "name": candidate.model.name,
-        "family": candidate.model.family,
-        "params": candidate.model.params,
-    } or selected.get("feature_set") != candidate.feature_set.name:
+    if selected.get("model") != model_record(candidate.model) or selected.get("feature_set") != candidate.feature_set.name:
         raise _stale("selected configuration differs from the current config", "tune")
     if selected.get("feature_artifacts") != {
         "train_sha256": candidate.feature_set.train_sha256,
@@ -453,11 +449,7 @@ def finalize_experiment(
             "status": "SUCCEEDED",
             "candidate_id": candidate.candidate_id,
             "feature_set": candidate.feature_set.name,
-            "model": {
-                "name": candidate.model.name,
-                "family": candidate.model.family,
-                "params": candidate.model.params,
-            },
+            "model": model_record(candidate.model),
             "task": config.task.type,
             "primary_metric": config.evaluation.primary_metric,
             "metrics": metrics,
@@ -472,6 +464,7 @@ def finalize_experiment(
             "fit_hyperparameters": output.best_hyperparameters,
             "seed": config.training.seed,
             "effective_seed": selected.get("effective_seed"),
+            **({"seed_note": selected["seed_note"]} if "seed_note" in selected else {}),
             "positive_class": output.positive_class,
             "target_conversion_applied": converted,
             "rows": {
@@ -526,7 +519,7 @@ def finalize_experiment(
             "hpo_effective": selected.get("hpo_effective"),
             "hpo_warning": selected.get("hpo_warning"),
             "models": [
-                {"name": m.name, "family": m.family, "params": m.params} for m in config.models
+                model_record(m) for m in config.models
             ],
             "feature_sets": [{"name": a.name} for a in plan.feature_sets],
             "seed": config.training.seed,

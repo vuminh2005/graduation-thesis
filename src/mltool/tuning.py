@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 import shutil
@@ -22,7 +22,8 @@ from mltool.autogluon_adapter import (
     AUTOGLUON_DEFAULT_SEARCHER_SEED,
 )
 from mltool.build_info import mltool_commit
-from mltool.config import HpoConfig, MLToolConfig, ModelConfig, TrainingConfig
+from mltool.custom_models import seed_note_record
+from mltool.config import HpoConfig, MLToolConfig, ModelConfig, TrainingConfig, model_record
 from mltool.evaluation import EvaluationError, evaluate_predictions
 from mltool.experiment import CandidateSpec, ExperimentPlan, sha256_file
 from mltool.cross_validation import (
@@ -364,11 +365,9 @@ def tuned_model_config(
     (RF/XT with no search space, and ENSEMBLE) the candidate's own configuration.
     """
     if hpo_effective and isinstance(best_hyperparameters, dict):
-        return ModelConfig(
-            name=candidate.model.name,
-            family=candidate.model.family,
-            params=dict(best_hyperparameters),
-        )
+        # replace(), so a SKLEARN model keeps its entrypoint and input mode;
+        # nothing is searched any more
+        return replace(candidate.model, params=dict(best_hyperparameters), search_space={})
     return candidate.model
 
 
@@ -436,11 +435,7 @@ def _validate_carry_over(
     """
     config = plan.config
     cid = candidate.candidate_id
-    if training_result.get("model") != {
-        "name": candidate.model.name,
-        "family": candidate.model.family,
-        "params": candidate.model.params,
-    } or training_result.get("feature_artifacts") != {
+    if training_result.get("model") != model_record(candidate.model) or training_result.get("feature_artifacts") != {
         "train_sha256": candidate.feature_set.train_sha256,
         "validation_sha256": candidate.feature_set.validation_sha256,
     }:
@@ -495,6 +490,7 @@ def _carried_over_result(
         "hpo": hpo_record(config.hpo, config.training),
         "seed": training_result.get("seed"),
         "effective_seed": training_result.get("effective_seed"),
+        **({"seed_note": training_result["seed_note"]} if "seed_note" in training_result else {}),
         "hpo_effective": False,
         "hpo_warning": hpo_not_applicable_warning(
             candidate.model.family, candidate.model.search_space
@@ -585,11 +581,7 @@ def _tune_candidate(
             "train_sha256": candidate.feature_set.train_sha256,
             "validation_sha256": candidate.feature_set.validation_sha256,
         },
-        "model": {
-            "name": candidate.model.name,
-            "family": candidate.model.family,
-            "params": candidate.model.params,
-        },
+        "model": model_record(candidate.model),
         "task": plan.config.task.type,
         "primary_metric": plan.config.evaluation.primary_metric,
         "metrics": metrics,
@@ -605,6 +597,7 @@ def _tune_candidate(
         ),
         "seed": plan.config.training.seed,
         "effective_seed": effective_model_seed(candidate.model, plan.config.training),
+        **seed_note_record(candidate.model, plan.config.training),
         "hpo_effective": hpo_warning is None,
         "hpo_warning": hpo_warning,
         "best_model": output.best_model,
@@ -630,11 +623,7 @@ def _failure(candidate: CandidateSpec, message: str, training: TrainingConfig) -
             "train_sha256": candidate.feature_set.train_sha256,
             "validation_sha256": candidate.feature_set.validation_sha256,
         },
-        "model": {
-            "name": candidate.model.name,
-            "family": candidate.model.family,
-            "params": candidate.model.params,
-        },
+        "model": model_record(candidate.model),
         "status": "FAILED",
         "error_message": message,
     }
@@ -669,6 +658,7 @@ def build_selected_configuration(
         "searcher_seed": (result.get("hpo") or {}).get("searcher_seed"),
         "seed": result["seed"],
         "effective_seed": result["effective_seed"],
+        **({"seed_note": result["seed_note"]} if "seed_note" in result else {}),
         "primary_metric": primary_metric,
         "tuned_validation_score": result["metrics"][primary_metric],
         "phase4_primary_score": result["phase4_primary_score"],
@@ -802,7 +792,7 @@ def tune_experiment(
             ),
             "source_dataset_fingerprint": plan.feature_manifest.get("source_dataset_fingerprint"),
             "models": [
-                {"name": model.name, "family": model.family, "params": model.params}
+                model_record(model)
                 for model in config.models
             ],
             "feature_sets": [

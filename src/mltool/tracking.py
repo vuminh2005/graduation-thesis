@@ -41,6 +41,15 @@ def _flatten(prefix: str, values: dict[str, Any] | None) -> dict[str, Any]:
     return {f"{prefix}.{key}": value for key, value in (values or {}).items()}
 
 
+def _custom_model_params(result: dict[str, Any]) -> dict[str, Any]:
+    """A SKLEARN model's entrypoint, input mode, source hash and seed note."""
+    model = result.get("model") or {}
+    params = {f"model_{key}": model[key] for key in ("entrypoint", "input", "source_sha256") if key in model}
+    if "seed_note" in result:
+        params["seed_note"] = result["seed_note"]
+    return params
+
+
 def search_space_text(spec: dict[str, Any]) -> str:
     """``real[0.005,0.2,log]``, ``int[16,128,default=31]``, ``categorical[true,false]``."""
     if spec["type"] == "categorical":
@@ -143,6 +152,7 @@ def log_training(config: MLToolConfig, result_set: Any):
                 "feature_set": result["feature_set"],
                 "model_name": result["model"]["name"],
                 "model_family": result["model"]["family"],
+                **_custom_model_params(result),
                 "model_params": result["model"]["params"],
                 "seed": result.get("seed"),
                 "effective_seed": result.get("effective_seed"),
@@ -188,6 +198,7 @@ def log_tuning(config: MLToolConfig, result_set: Any):
                 "feature_set": result["feature_set"],
                 "model_name": result["model"]["name"],
                 "model_family": result["model"]["family"],
+                **_custom_model_params(result),
                 "num_trials": hpo.num_trials if hpo else None,
                 "top_n": hpo.top_n if hpo else None,
                 "hpo_time_limit_seconds": hpo.time_limit_seconds if hpo else None,
@@ -241,6 +252,7 @@ def log_final(config: MLToolConfig, final: Any):
             "feature_set": result["feature_set"],
             "model_name": result["model"]["name"],
             "model_family": result["model"]["family"],
+            **_custom_model_params(result),
             "seed": result.get("seed"),
             "effective_seed": result.get("effective_seed"),
             "primary_metric": result["primary_metric"],
