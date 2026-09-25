@@ -177,7 +177,7 @@ def test_finalize_refits_on_train_plus_validation_and_persists(tmp_path: Path) -
     assert stored["effective_seed"] == 7 and stored["seed"] == 7
     assert stored["rows"] == {"train_validation": 85, "test": 15}
     assert stored["refit"]["fit_split"] == "train+validation"
-    assert stored["predictor_path"] == str(final / "predictor")
+    assert stored["predictor_path"] == "predictor"  # relative to .mltool/final
     assert result.result["metrics"] == stored["metrics"]
 
 
@@ -226,7 +226,8 @@ def test_split_config_change_after_prepare_is_stale(tmp_path: Path) -> None:
     raw = yaml.safe_load(path.read_text())
     raw["split"]["random_seed"] = 1
     path.write_text(yaml.safe_dump(raw, sort_keys=False))
-    with pytest.raises(FinalizeError, match='split configuration differs.*"mltool prepare"'):
+    # Since Phase 12 the plan already refuses: features built on a stale prepare are stale.
+    with pytest.raises(ExperimentError, match='split configuration differs.*"mltool prepare"'):
         run_finalize(path)
 
 
@@ -571,14 +572,13 @@ def test_refit_preprocessor_and_plugin_state_are_persisted_and_reproduce_the_fit
     assert not (final / "feature_plugins" / f"{'b' if chosen == 'a' else 'a'}.pkl").exists()
     result = json.loads((final / "result.json").read_text())
     manifest = json.loads((final / "manifest.json").read_text())
-    assert result["refit"]["preprocessor"]["artifact"] == str(final / "preprocessor.pkl")
-    assert result["refit"]["feature_plugins"][0]["artifact"] == str(
-        final / "feature_plugins" / f"{chosen}.pkl"
-    )
+    # relative to .mltool/final, so they resolve in every registry copy too
+    assert result["refit"]["preprocessor"]["artifact"] == "preprocessor.pkl"
+    assert result["refit"]["feature_plugins"][0]["artifact"] == f"feature_plugins/{chosen}.pkl"
     assert manifest["artifacts"] == {
-        "predictor": str(final / "predictor"),
-        "preprocessor": str(final / "preprocessor.pkl"),
-        "feature_plugins": {chosen: str(final / "feature_plugins" / f"{chosen}.pkl")},
+        "predictor": "predictor",
+        "preprocessor": "preprocessor.pkl",
+        "feature_plugins": {chosen: f"feature_plugins/{chosen}.pkl"},
     }
 
     with (final / "preprocessor.pkl").open("rb") as stream:

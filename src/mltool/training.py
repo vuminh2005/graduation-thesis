@@ -17,11 +17,13 @@ from pandas.api.types import is_numeric_dtype
 
 from mltool.autogluon_adapter import AutoGluonAdapter, AutoGluonError, effective_model_seed
 from mltool.custom_models import seed_note_record
-from mltool.config import MLToolConfig, TrainingConfig, model_record
+from mltool.config import MLToolConfig, TrainingConfig, model_record, relative_path
 from mltool.evaluation import EvaluationError, evaluate_predictions
 from mltool.build_info import mltool_commit
 from mltool.resources import resolve_resource_limits
 from mltool.experiment import CandidateSpec, ExperimentPlan, ExperimentError
+from mltool.preprocessing import preprocessor_source_sha256
+from mltool.splitting import should_stratify
 
 
 class TrainingError(ValueError):
@@ -345,7 +347,7 @@ def _train_candidate(
         "positive_class": output.positive_class,
         "target_conversion_applied": converted,
         "training_seconds": float(time.perf_counter() - started),
-        "predictor_path": str(final_candidate_path / "predictor"),
+        "predictor_path": relative_path(final_candidate_path / "predictor", final_candidate_path),
         "autogluon_version": output.autogluon_version,
         "trained_models": output.trained_models,
         "status": "SUCCEEDED",
@@ -494,16 +496,23 @@ def train_experiment(
                 ),
                 _autogluon_version(),
             ),
-            "feature_manifest": str(plan.feature_manifest_path),
+            "feature_manifest": relative_path(plan.feature_manifest_path, output_path),
             "source_dataset_fingerprint": plan.feature_manifest.get(
                 "source_dataset_fingerprint"
+            ),
+            # What the scores were computed from beyond the feature bytes: CV
+            # folds re-split the raw rows and re-run the preprocessor and plugins.
+            "split": split_signature(plan.config),
+            "preprocessor_source_sha256": preprocessor_source_sha256(
+                plan.config.preprocessing.external, plan.config.config_path
             ),
             "feature_sets": [
                 {
                     "name": artifact.name,
-                    "manifest": str(artifact.manifest_path),
+                    "manifest": relative_path(artifact.manifest_path, output_path),
                     "source_columns": artifact.manifest.get("source_columns"),
                     "plugins": artifact.manifest.get("plugins"),
+                    "recipe_fingerprint": artifact.recipe_fingerprint,
                     "train_sha256": artifact.train_sha256,
                     "validation_sha256": artifact.validation_sha256,
                 }
@@ -526,10 +535,7 @@ def train_experiment(
             "mltool_commit": mltool_commit(),
             "successful_count": succeeded,
             "failed_count": len(candidate_results) - succeeded,
-            "leaderboard": {
-                "csv": str(output_path / "leaderboard.csv"),
-                "json": str(output_path / "leaderboard.json"),
-            },
+            "leaderboard": {"csv": "leaderboard.csv", "json": "leaderboard.json"},
             "test_data_used": False,
         }
         (staging / "manifest.json").write_text(
@@ -553,6 +559,16 @@ def train_experiment(
         leaderboard=leaderboard,
         cv=cv_plan.summary() if cv_plan is not None else None,
     )
+
+
+def split_signature(config: MLToolConfig) -> dict[str, Any]:
+    """The split settings a training run used; prepare must have used the same."""
+    return {
+        "random_seed": config.split.random_seed,
+        "validation_ratio": config.split.validation_ratio,
+        "test_ratio": config.split.test_ratio,
+        "stratified": should_stratify(config.task.type, config.split.stratify),
+    }
 
 
 def cv_signature(config: MLToolConfig) -> dict[str, int] | None:

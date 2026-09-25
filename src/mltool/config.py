@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 from typing import Any
@@ -81,6 +82,8 @@ class TaskConfig:
 class DataConfig:
     path: Path
     format: str
+    # Row identifiers `mltool score` copies into its output; nothing else uses them.
+    id_columns: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -151,6 +154,14 @@ def source_sha256(path: Path | None) -> str | None:
         return hashlib.sha256(Path(path).read_bytes()).hexdigest() if path else None
     except OSError:
         return None
+
+
+def relative_path(path: Path | str, start: Path | str) -> str:
+    """``path`` as recorded in a manifest: relative to the directory holding that manifest.
+
+    Recorded paths stay valid when a project or a registry version is moved or copied.
+    """
+    return Path(os.path.relpath(Path(path), Path(start))).as_posix()
 
 
 def model_record(model: ModelConfig) -> dict[str, Any]:
@@ -775,7 +786,7 @@ def load_config(path: Path | str = Path("mltool.yaml")) -> MLToolConfig:
     data_raw = _mapping(raw, "data")
     _reject_unknown(project_raw, {"name"}, "project")
     _reject_unknown(task_raw, {"type", "target", "positive_class"}, "task")
-    _reject_unknown(data_raw, {"path", "format"}, "data")
+    _reject_unknown(data_raw, {"path", "format", "id_columns"}, "data")
 
     project_name = _non_empty_string(project_raw, "name", "project.name")
     task_type = _non_empty_string(task_raw, "type", "task.type")
@@ -797,6 +808,15 @@ def load_config(path: Path | str = Path("mltool.yaml")) -> MLToolConfig:
         supported = ", ".join(sorted(SUPPORTED_FORMATS))
         raise ConfigError(f'unsupported data format "{data_format}"; expected one of: {supported}')
     data_path = (config_path.parent / data_path_text).resolve()
+    id_columns = data_raw.get("id_columns", [])
+    if not isinstance(id_columns, list) or not all(
+        isinstance(column, str) and column for column in id_columns
+    ):
+        raise ConfigError('"data.id_columns" must be a list of non-empty strings')
+    if len(id_columns) != len(set(id_columns)):
+        raise ConfigError('"data.id_columns" must contain unique values')
+    if target in id_columns:
+        raise ConfigError(f'"data.id_columns" may not contain the target column "{target}"')
 
     validation_raw = raw.get("validation", {})
     if not isinstance(validation_raw, dict):
@@ -888,7 +908,7 @@ def load_config(path: Path | str = Path("mltool.yaml")) -> MLToolConfig:
             target=target,
             positive_class=positive_class if has_positive_class else None,
         ),
-        data=DataConfig(path=data_path, format=data_format),
+        data=DataConfig(path=data_path, format=data_format, id_columns=list(id_columns)),
         validation=validation,
         split=split,
         preprocessing=preprocessing,

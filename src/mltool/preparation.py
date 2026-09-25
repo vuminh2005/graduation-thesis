@@ -14,7 +14,12 @@ import cloudpickle
 
 from mltool.config import MLToolConfig
 from mltool.data import LoadedDataset
-from mltool.preprocessing import PreprocessedSplits, PreprocessingError, preprocess_splits
+from mltool.preprocessing import (
+    PreprocessedSplits,
+    PreprocessingError,
+    preprocess_splits,
+    preprocessor_source_sha256,
+)
 from mltool.splitting import DatasetSplits, SplitError, split_dataset
 
 
@@ -104,7 +109,6 @@ def _manifest(
     dataset: LoadedDataset,
     splits: DatasetSplits,
     prepared: PreprocessedSplits,
-    output_dir: Path,
 ) -> dict[str, Any]:
     manifest: dict[str, Any] = {
         "source": {
@@ -123,10 +127,11 @@ def _manifest(
             "test_rows": len(prepared.test),
         },
         "preprocessing": {"enabled": config.preprocessing.external.enabled},
+        # relative to this manifest's directory
         "outputs": {
-            "train": str(output_dir / "train.parquet"),
-            "validation": str(output_dir / "validation.parquet"),
-            "test": str(output_dir / "test.parquet"),
+            "train": "train.parquet",
+            "validation": "validation.parquet",
+            "test": "test.parquet",
         },
     }
     if config.preprocessing.external.enabled:
@@ -135,7 +140,11 @@ def _manifest(
                 "entrypoint": config.preprocessing.external.entrypoint,
                 "resolved_entrypoint": prepared.resolved_entrypoint,
                 "params": config.preprocessing.external.params,
-                "artifact": str(output_dir / "preprocessor.pkl"),
+                # editing the preprocessor file makes these artifacts stale
+                "source_sha256": preprocessor_source_sha256(
+                    config.preprocessing.external, config.config_path
+                ),
+                "artifact": "preprocessor.pkl",
             }
         )
     return manifest
@@ -187,7 +196,7 @@ def _materialize(
                     f"could not serialize fitted external preprocessor: {exc}"
                 ) from exc
 
-        manifest = _manifest(config, dataset, splits, prepared, output_dir)
+        manifest = _manifest(config, dataset, splits, prepared)
         (staging / "manifest.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",

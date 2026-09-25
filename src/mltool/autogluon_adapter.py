@@ -502,6 +502,35 @@ class AutoGluonAdapter:
             autogluon_best_trial=autogluon_best_trial,
         )
 
+    def predict_saved(
+        self, *, predictor_path: Path, features: pd.DataFrame, task_type: str
+    ) -> tuple[pd.Series, pd.DataFrame | None]:
+        """``mltool score``: load a saved predictor (no fit) and predict ``features``.
+
+        Predictions and class probabilities are produced exactly as ``fit_final``
+        produces them for the test split.
+        """
+        try:
+            predictor = self._factory().load(str(predictor_path))
+            frame = features.copy(deep=True)
+            probabilities = None
+            if task_type in {"binary", "multiclass"}:
+                probabilities = predictor.predict_proba(frame, as_multiclass=True)
+                predictions = predictor.predict_from_proba(probabilities)
+            else:
+                predictions = predictor.predict(frame)
+        except (Exception, SystemExit) as exc:
+            raise AutoGluonError(str(exc)) from exc
+        if not isinstance(predictions, pd.Series):
+            predictions = pd.Series(predictions, index=features.index)
+        if probabilities is not None and not isinstance(probabilities, pd.DataFrame):
+            probabilities = pd.DataFrame(probabilities, index=features.index)
+        if len(predictions) != len(features) or (
+            probabilities is not None and len(probabilities) != len(features)
+        ):
+            raise AutoGluonError("AutoGluon returned the wrong number of predictions")
+        return predictions, probabilities
+
     def fit_final(
         self,
         *,

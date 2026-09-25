@@ -1,4 +1,4 @@
-"""Command-line entry points for MLTool Phases 1 through 7."""
+"""Command-line entry points for every MLTool command."""
 
 from __future__ import annotations
 
@@ -38,6 +38,7 @@ from mltool.tuning import (
 from mltool import tracking
 from mltool.registry import RegistryBlocked, RegistryError, register_final
 from mltool.reporting import render_best, render_logs, render_status
+from mltool.scoring import ScoringError, render_scoring_error, score
 from mltool.state import StateError, TrackedRun
 from mltool.validation import validate_dataset
 
@@ -217,6 +218,16 @@ def _parser() -> argparse.ArgumentParser:
     logs = subparsers.add_parser("logs", help="show the recorded run history")
     logs.add_argument("--limit", type=int, default=20, help="number of runs to show")
     subparsers.add_parser("best", help="show the finalized and latest registered model")
+    scoring = subparsers.add_parser(
+        "score", help="predict raw rows with a registered model, using only its registry files"
+    )
+    scoring.add_argument("--input", required=True, type=Path, help="raw rows (.csv or .parquet)")
+    scoring.add_argument("--output", required=True, type=Path, help="predictions (.csv or .parquet)")
+    scoring.add_argument("--version", type=int, default=None, help="registry version (default: latest)")
+    scoring.add_argument(
+        "--registry", type=Path, default=Path(".mltool/registry"),
+        help="registry directory (default: ./.mltool/registry)",
+    )
     return parser
 
 
@@ -543,6 +554,22 @@ def best_project(config_path: Path = Path("mltool.yaml")) -> int:
     return 0
 
 
+def score_project(
+    *, input_path: Path, output_path: Path, version: int | None = None,
+    registry: Path = Path(".mltool/registry"),
+) -> int:
+    """Not tracked: it writes only the requested output file, never project state."""
+    try:
+        result = score(
+            registry=registry, input_path=input_path, output_path=output_path, version=version
+        )
+    except ScoringError as exc:
+        print(render_scoring_error(str(exc)))
+        return 2
+    print(result.render())
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -574,6 +601,11 @@ def main(argv: list[str] | None = None) -> int:
             return status_project()
         if args.command == "logs":
             return logs_project(limit=args.limit)
+        if args.command == "score":
+            return score_project(
+                input_path=args.input, output_path=args.output, version=args.version,
+                registry=args.registry,
+            )
         return best_project()
     except Exception as exc:  # Keep unexpected failures concise for CLI users.
         print(f"MLTool failed unexpectedly: {exc}", file=sys.stderr)

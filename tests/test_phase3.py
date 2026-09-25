@@ -89,8 +89,10 @@ def test_missing_features_section_defaults_to_base_and_materializes(
     }
 
     assert features_project(config_path) == 0
+    # the test frame is built but not persisted (nothing reads it)
+    assert not (tmp_path / ".mltool/features/base/test.parquet").exists()
 
-    for split in ("train", "validation", "test"):
+    for split in ("train", "validation"):
         frame = read_set(tmp_path, "base", split)
         assert frame.columns.tolist() == [
             "row_id",
@@ -315,7 +317,7 @@ def test_plugin_relative_entrypoint_train_only_state_and_independent_instances(
 
     for set_name in ("focused", "wide"):
         schemas: list[list[str]] = []
-        for split in ("train", "validation", "test"):
+        for split in ("train", "validation"):
             frame = read_set(tmp_path, set_name, split)
             schemas.append(frame.columns.tolist())
             assert frame["label"].tolist() == [
@@ -327,7 +329,7 @@ def test_plugin_relative_entrypoint_train_only_state_and_independent_instances(
             pd.testing.assert_series_equal(
                 frame["centered_income"], expected, check_names=False
             )
-        assert schemas[0] == schemas[1] == schemas[2]
+        assert schemas[0] == schemas[1]
 
 
 @pytest.mark.parametrize(
@@ -572,7 +574,7 @@ def test_plugin_cannot_mutate_owned_base_frames(tmp_path: Path) -> None:
     prepare(config_path)
     assert features_project(config_path) == 0
 
-    for split in ("train", "validation", "test"):
+    for split in ("train", "validation"):
         frame = read_set(tmp_path, "safe", split)
         assert frame["income"].tolist() == [
             1000.0 + row_id * 10 for row_id in frame["row_id"]
@@ -636,9 +638,14 @@ def test_multiple_feature_sets_manifests_lineage_and_global_manifest(
         4,
         3,
     ]
-    assert all(
-        Path(item["path"]).is_dir() for item in global_manifest["feature_sets"]
+    assert all(  # relative to .mltool/features/
+        (tmp_path / ".mltool/features" / item["path"]).is_dir()
+        for item in global_manifest["feature_sets"]
     )
+    assert [item["path"] for item in global_manifest["feature_sets"]] == ["base", "ratio_set"]
+    assert global_manifest["prepared_input"] == {
+        "path": "../prepared", "manifest": "../prepared/manifest.json"
+    }
 
 
 def test_missing_prepared_artifacts_requests_prepare(
@@ -723,7 +730,7 @@ def test_repeated_materialization_is_deterministic(tmp_path: Path) -> None:
     assert features_project(config_path) == 0
     first_frames = {
         split: read_set(tmp_path, "base", split)
-        for split in ("train", "validation", "test")
+        for split in ("train", "validation")
     }
     first_manifest = (tmp_path / ".mltool/features/manifest.json").read_text()
 

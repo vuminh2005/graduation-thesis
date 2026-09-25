@@ -23,7 +23,14 @@ from mltool.autogluon_adapter import (
 )
 from mltool.build_info import mltool_commit
 from mltool.custom_models import seed_note_record
-from mltool.config import HpoConfig, MLToolConfig, ModelConfig, TrainingConfig, model_record
+from mltool.config import (
+    HpoConfig,
+    MLToolConfig,
+    ModelConfig,
+    TrainingConfig,
+    model_record,
+    relative_path,
+)
 from mltool.evaluation import EvaluationError, evaluate_predictions
 from mltool.experiment import CandidateSpec, ExperimentPlan, sha256_file
 from mltool.cross_validation import (
@@ -33,6 +40,7 @@ from mltool.cross_validation import (
     cv_score_candidate,
     progress,
 )
+from mltool.preprocessing import preprocessor_source_sha256
 from mltool.resources import resolve_resource_limits
 from mltool.training import (
     TrainingError,
@@ -46,6 +54,7 @@ from mltool.training import (
     _cv_header,
     _fold_sd_note,
     _row_score_parts,
+    split_signature,
 )
 
 
@@ -298,18 +307,70 @@ def _validate_training_freshness(plan: ExperimentPlan, manifest: dict[str, Any])
         "source_dataset_fingerprint"
     ):
         raise _training_stale("source dataset fingerprint differs from the feature artifacts")
-    trained_hashes = {
-        entry.get("name"): (entry.get("train_sha256"), entry.get("validation_sha256"))
+    trained_sets = {
+        entry.get("name"): entry
         for entry in manifest.get("feature_sets", [])
         if isinstance(entry, dict)
     }
     for artifact in plan.feature_sets:
-        if trained_hashes.get(artifact.name) != (
+        entry = trained_sets.get(artifact.name, {})
+        if (entry.get("train_sha256"), entry.get("validation_sha256")) != (
             artifact.train_sha256,
             artifact.validation_sha256,
         ):
             raise _training_stale(
                 f'feature set "{artifact.name}" was re-materialized after training'
+            )
+    _validate_training_inputs(plan, manifest, trained_sets)
+
+
+def _validate_training_inputs(
+    plan: ExperimentPlan, manifest: dict[str, Any], trained_sets: dict[Any, dict[str, Any]]
+) -> None:
+    """What the training scores depend on beyond the feature bytes, for every candidate.
+
+    A cross-validated candidate never reads ``features/``: each fold re-splits
+    the raw rows with ``split.random_seed`` and re-runs the preprocessor and the
+    plugins. Identical feature bytes therefore do not prove its scores current.
+
+    Older manifests lack these records. A missing one counts as fresh only where
+    it is provably equivalent: no preprocessor, a FeatureSet without plugins,
+    and split settings (which the fold fingerprint below pins for CV, and the
+    feature bytes pin for holdout).
+    """
+    config = plan.config
+    recorded_split = manifest.get("split")
+    if recorded_split is not None and recorded_split != split_signature(config):
+        raise _training_stale("split settings differ from the current config")
+    current_preprocessor = preprocessor_source_sha256(
+        config.preprocessing.external, config.config_path
+    )
+    if "preprocessor_source_sha256" not in manifest:
+        if config.preprocessing.external.enabled:
+            raise _training_stale("training predates preprocessor source hashing")
+    elif manifest["preprocessor_source_sha256"] != current_preprocessor:
+        raise _training_stale("the external preprocessor source file changed after training")
+    for artifact in plan.feature_sets:
+        entry = trained_sets.get(artifact.name, {})
+        if "recipe_fingerprint" not in entry:
+            if artifact.manifest.get("plugins"):
+                raise _training_stale(
+                    f'training predates recipe fingerprinting of feature set "{artifact.name}"'
+                )
+        elif entry["recipe_fingerprint"] != artifact.recipe_fingerprint:
+            raise _training_stale(
+                f'feature set "{artifact.name}" recipe or plugin source changed after training'
+            )
+    if config.evaluation.cv is not None:
+        try:
+            current = build_cv_plan(config).fingerprint
+        except CrossValidationError as exc:
+            raise TuningError(str(exc)) from exc
+        recorded = (manifest.get("cv") or {}).get("fold_fingerprint")
+        if recorded != current:
+            # e.g. trained while split.random_seed differed from the prepared split
+            raise _training_stale(
+                "its cross-validation folds differ from the folds of the current prepared split"
             )
 
 
@@ -498,11 +559,10 @@ def _carried_over_result(
         "search_space": candidate.model.search_space,
         "effective_search_space": {},
         "carried_over_from_training": True,
-        "training_result": str(
-            config.config_path.parent
-            / ".mltool/training/candidates"
-            / candidate.candidate_id
-            / "result.json"
+        "training_result": relative_path(
+            config.config_path.parent / ".mltool/training/candidates" / candidate.candidate_id
+            / "result.json",
+            config.config_path.parent / ".mltool/tuning/candidates" / candidate.candidate_id,
         ),
         "best_model": None,
         "best_hyperparameters": dict(candidate.model.params),
@@ -606,7 +666,7 @@ def _tune_candidate(
         "tie_break_applied": bool(output.tied_trials),
         "tied_trials": list(output.tied_trials),
         "autogluon_best_trial": output.autogluon_best_trial,
-        "predictor_path": str(final_candidate_path / "predictor"),
+        "predictor_path": relative_path(final_candidate_path / "predictor", final_candidate_path),
         "autogluon_version": output.autogluon_version,
         "trained_models": output.trained_models,
         "status": "SUCCEEDED",
@@ -666,7 +726,10 @@ def build_selected_configuration(
         "feature_artifacts": result["feature_artifacts"],
         "positive_class": result["positive_class"],
         "autogluon_version": result["autogluon_version"],
-        "predictor_path": result["predictor_path"],
+        # relative to tuning/, where selected.json lives
+        "predictor_path": (
+            f"candidates/{best_id}/{result['predictor_path']}" if result["predictor_path"] else None
+        ),
         "test_data_used": False,
     }
 
@@ -786,7 +849,9 @@ def tune_experiment(
                 for candidate in selection.candidates
             },
             "resource_limits": resolve_resource_limits(config.training).as_record(),
-            "training_manifest": str(project_root / ".mltool/training/manifest.json"),
+            "training_manifest": relative_path(
+                project_root / ".mltool/training/manifest.json", output_path
+            ),
             "training_manifest_sha256": sha256_file(
                 project_root / ".mltool/training/manifest.json"
             ),
@@ -806,11 +871,8 @@ def tune_experiment(
             "successful_count": succeeded,
             "failed_count": len(candidate_results) - succeeded,
             "selected_candidate_id": selected["candidate_id"] if selected else None,
-            "leaderboard": {
-                "csv": str(output_path / "leaderboard.csv"),
-                "json": str(output_path / "leaderboard.json"),
-            },
-            "selected": str(output_path / "selected.json") if selected else None,
+            "leaderboard": {"csv": "leaderboard.csv", "json": "leaderboard.json"},
+            "selected": "selected.json" if selected else None,
             "test_data_used": False,
         }
         _write_json(staging / "manifest.json", manifest)

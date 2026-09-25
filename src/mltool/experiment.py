@@ -14,7 +14,9 @@ from mltool.config import FeatureSetConfig, MLToolConfig, ModelConfig
 from mltool.feature_materialization import (
     FeatureMaterializationError,
     prepared_artifacts_fingerprint,
+    validate_prepared_manifest,
 )
+from mltool.feature_plugins import plugin_source_sha256
 
 
 class ExperimentError(ValueError):
@@ -34,6 +36,8 @@ class FeatureSetArtifact:
     feature_columns: list[str]
     train_rows: int
     validation_rows: int
+    # recipe_fingerprint(feature_set_recipe(...)), including plugin source hashes
+    recipe_fingerprint: str = ""
 
 
 @dataclass(frozen=True)
@@ -180,8 +184,10 @@ def feature_set_recipe(
     """Everything about a FeatureSet that decides which columns it materializes.
 
     The single definition of a "recipe": ``_validate_recipe`` checks a
-    materialized manifest against it, and ``finalize`` fingerprints it so a
-    later recipe change can be detected without re-reading ``features/``.
+    materialized manifest against it, and ``train`` and ``finalize``
+    fingerprint it so a later recipe change can be detected without re-reading
+    ``features/``. It includes each plugin file's SHA-256, since ``finalize``
+    and every CV fold execute the plugin code as it is now.
     """
     catalog = {plugin.name: plugin for plugin in config.features.plugins}
     return {
@@ -194,6 +200,7 @@ def feature_set_recipe(
                 "name": name,
                 "entrypoint": catalog[name].entrypoint,
                 "params": catalog[name].params,
+                "source_sha256": plugin_source_sha256(catalog[name], config.config_path),
             }
             for name in spec.plugins
         ],
@@ -255,6 +262,17 @@ def _validate_recipe(
             raise _stale(
                 f'feature set "{spec.name}" plugin "{expected["name"]}" configuration changed'
             )
+        # Missing key: materialized before plugin files were hashed, so the
+        # code that produced these columns cannot be proven to be today's.
+        if "source_sha256" not in plugin_entry:
+            raise _stale(
+                f'feature set "{spec.name}" plugin "{expected["name"]}" predates plugin '
+                "source hashing"
+            )
+        if plugin_entry["source_sha256"] != expected["source_sha256"]:
+            raise _stale(
+                f'feature set "{spec.name}" plugin "{expected["name"]}" source file changed'
+            )
 
     final_columns = manifest.get("final_feature_columns")
     if not isinstance(final_columns, list) or not final_columns or not all(
@@ -291,6 +309,11 @@ def _read_training_split(
 
 
 def load_feature_artifacts(config: MLToolConfig) -> tuple[Path, dict[str, Any], list[FeatureSetArtifact]]:
+    # Features built on a stale preparation are stale too, whatever their bytes.
+    try:
+        validate_prepared_manifest(config)
+    except FeatureMaterializationError as exc:
+        raise ExperimentError(str(exc)) from exc
     root = config.config_path.parent
     features_path = root / ".mltool/features"
     global_manifest_path = features_path / "manifest.json"
@@ -325,6 +348,7 @@ def load_feature_artifacts(config: MLToolConfig) -> tuple[Path, dict[str, Any], 
         final_columns = _validate_recipe(
             config, spec, manifest, list(prepared_feature_columns)
         )
+        recipe = feature_set_recipe(config, spec, list(prepared_feature_columns))
         train_path = set_path / "train.parquet"
         validation_path = set_path / "validation.parquet"
         train = _read_training_split(
@@ -361,6 +385,7 @@ def load_feature_artifacts(config: MLToolConfig) -> tuple[Path, dict[str, Any], 
                 feature_columns=final_columns,
                 train_rows=len(train),
                 validation_rows=len(validation),
+                recipe_fingerprint=recipe_fingerprint(recipe),
             )
         )
     return global_manifest_path, global_manifest, artifacts

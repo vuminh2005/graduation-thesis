@@ -12,7 +12,7 @@ from typing import Any
 
 import pandas as pd
 
-from mltool.config import FeaturePluginConfig
+from mltool.config import FeaturePluginConfig, source_sha256
 
 
 class FeaturePluginError(ValueError):
@@ -41,6 +41,18 @@ def _resolve_entrypoint(entrypoint: str, config_path: Path) -> tuple[Path, str]:
     if not plugin_path.is_file():
         raise FeaturePluginError(f"feature plugin file not found: {plugin_path}")
     return plugin_path, class_name.strip()
+
+
+def plugin_source_sha256(spec: FeaturePluginConfig, config_path: Path) -> str | None:
+    """SHA-256 of the plugin's entrypoint file, or None when it cannot be read.
+
+    Only that one file is hashed: a sibling module it imports is not tracked.
+    """
+    try:
+        path, _ = _resolve_entrypoint(spec.entrypoint, config_path)
+    except FeaturePluginError:
+        return None
+    return source_sha256(path)
 
 
 def load_feature_plugin(

@@ -366,7 +366,12 @@ def test_external_plugin_is_train_only_stateful_aligned_and_persisted(
         "drop_column": "drop_me",
         "multiplier": 3,
     }
-    assert manifest["preprocessing"]["artifact"] == str(result.preprocessor_path)
+    # recorded relative to the manifest's own directory
+    assert manifest["preprocessing"]["artifact"] == "preprocessor.pkl"
+    assert result.manifest_path.parent / "preprocessor.pkl" == result.preprocessor_path
+    assert manifest["outputs"] == {
+        "train": "train.parquet", "validation": "validation.parquet", "test": "test.parquet"
+    }
 
 
 @pytest.mark.parametrize(

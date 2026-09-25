@@ -573,17 +573,21 @@ def test_a_selected_recipe_change_blocks_register_until_forced(
 
 
 @pytest.mark.parametrize("dimension", SET_DIMENSIONS)
-def test_a_recipe_change_to_another_feature_set_keeps_the_final_fresh(
+def test_a_recipe_change_to_another_feature_set_makes_the_final_stale_too(
     tmp_path: Path, dimension: str
 ) -> None:
+    """Phase 12: the final model is stale iff finalize would refuse. The other
+    set's features are stale, so the plan (and finalize) refuses, and the
+    selection this final model came from compared against that set."""
     path = recipe_build(tmp_path / dimension)
     root = path.parent
     others = [name for name in ("one", "two") if name != selected_set(root)]
     edit_set(path, others[0], dimension)
-    assert load_persisted_final(load_config(path)).warning is None
-    assert register_project(path) == 0
-    metadata = json.loads((root / ".mltool/registry/1/metadata.json").read_text())
-    assert metadata["warning"] is None and metadata["forced"] is False
+    warning = load_persisted_final(load_config(path)).warning
+    assert warning is not None and warning.startswith("finalize would refuse")
+    assert f'feature set "{others[0]}"' in warning
+    assert register_project(path) == 2
+    assert list_versions(root) == []
 
 
 def test_a_final_model_without_a_recipe_fingerprint_is_stale(tmp_path: Path) -> None:

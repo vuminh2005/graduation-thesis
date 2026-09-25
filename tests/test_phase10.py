@@ -14,7 +14,7 @@ from autogluon.common import space
 from mltool.autogluon_adapter import AutoGluonAdapter, AutoGluonError, effective_search_space
 from mltool.cli import final_result_project, register_project, tune_project
 from mltool.config import ConfigError, HpoConfig, ModelConfig, TaskConfig, TrainingConfig, load_config
-from mltool.experiment import build_experiment_plan
+from mltool.experiment import build_experiment_plan, sha256_file
 from mltool.finalize import FinalizeError, load_finalize_input, load_persisted_final
 from mltool.training import load_persisted_leaderboard
 from mltool.tracking import search_space_text
@@ -368,14 +368,25 @@ def test_the_selected_models_search_space_change_makes_the_final_model_stale(
     path = build(tmp_path, models=[GBM_SS, RF_SS], through="finalize")
     selected = json.loads((tmp_path / ".mltool/final/manifest.json").read_text())["selected"]
     other = "forest" if selected["model"]["name"] == "lightgbm" else "lightgbm"
-    change_space(path, other, None)  # another model's space: the final model is untouched
-    assert load_persisted_final(load_config(path)).warning is None
     change_space(path, selected["model"]["name"], {"learning_rate": LR})
     warning = load_persisted_final(load_config(path)).warning
-    assert warning == "the selected model's search space changed after this final model was created"
+    assert warning.startswith("finalize would refuse") and "search_space differs" in warning
     capsys.readouterr()
     assert register_project(path) == 2
-    assert final_result_project(path) == 0 and "search space changed" in capsys.readouterr().out
+    assert final_result_project(path) == 0 and "search_space differs" in capsys.readouterr().out
+
+
+def test_another_models_search_space_change_makes_the_final_model_stale_too(
+    tmp_path: Path,
+) -> None:
+    """Phase 12 (one rule): finalize refuses on a stale tuning signature, whichever
+    model changed, so the final model is stale as well."""
+    path = build(tmp_path, models=[GBM_SS, RF_SS], through="finalize")
+    selected = json.loads((tmp_path / ".mltool/final/manifest.json").read_text())["selected"]
+    other = "forest" if selected["model"]["name"] == "lightgbm" else "lightgbm"
+    change_space(path, other, None)
+    warning = load_persisted_final(load_config(path)).warning
+    assert warning.startswith("finalize would refuse") and "search_space differs" in warning
 
 
 def test_artifacts_from_before_search_spaces_are_fresh_without_one(tmp_path: Path) -> None:
@@ -387,6 +398,9 @@ def test_artifacts_from_before_search_spaces_are_fresh_without_one(tmp_path: Pat
     final_path = tmp_path / ".mltool/final/manifest.json"
     final = json.loads(final_path.read_text())
     final["selected"].pop("search_space")
+    # the rewritten tuning manifest stands for one written by that older version,
+    # which this final model was built from
+    final["tuning_manifest_sha256"] = sha256_file(tmp_path / ".mltool/tuning/manifest.json")
     final_path.write_text(json.dumps(final), encoding="utf-8")
     config = load_config(path)
     assert load_persisted_tuning(config).warning is None

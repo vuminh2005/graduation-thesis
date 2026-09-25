@@ -1,10 +1,17 @@
 # MLTool
 
 MLTool validates and prepares tabular supervised-ML projects, materializes
-reproducible feature sets, and compares isolated AutoGluon model families on a
-shared validation split. It tunes the best candidates and selects one
-configuration, then `finalize` refits it on train+validation and evaluates it
-once on the test split; every earlier phase leaves that split untouched.
+reproducible feature sets (optionally with your own feature plugins), and
+compares isolated AutoGluon model families and your own sklearn-compatible
+estimators, on a shared validation split or by cross-validation. It tunes the
+best candidates and selects one configuration, then `finalize` refits it on
+train+validation and evaluates it once on the test split. `register` versions
+the result, and `score` predicts raw rows from a registry version alone.
+
+No phase before `finalize` fits on, scores on or selects with the test split:
+`prepare` writes it, `features` runs the fitted plugins over it only to check
+their contract (the result is not persisted), and later phases open the
+prepared test file only to fingerprint its bytes.
 
 ## Install for development
 
@@ -42,6 +49,8 @@ mkdir demo && cd demo
 /path/to/graduation-thesis/.venv/bin/mltool status
 /path/to/graduation-thesis/.venv/bin/mltool logs
 /path/to/graduation-thesis/.venv/bin/mltool best
+# predictions for new raw rows, from the latest registry version only
+/path/to/graduation-thesis/.venv/bin/mltool score --input new_rows.csv --output predictions.csv
 ```
 
 **Input data.** Provide a CSV or Parquet file with one column per feature plus
@@ -133,7 +142,8 @@ and the ensemble config where a single family would show its hyperparameters.
 
 Training artifacts live under `.mltool/training/`, including one predictor and
 result per candidate plus JSON/CSV global leaderboards. `leaderboard` is
-read-only. Phases 4 and 5 never load or evaluate FeatureSet `test.parquet` files.
+read-only. `features` writes only each FeatureSet's `train.parquet` and
+`validation.parquet`; there is no FeatureSet test file to read.
 
 `tune` (Phase 5) needs an optional `hpo:` section, which `init` does not write:
 
@@ -146,8 +156,9 @@ hpo:
 ```
 
 It refuses to run on stale training artifacts, re-fits each selected candidate
-on its FeatureSet train split with a local, sequential random search
-(`num_trials`, `time_limit_seconds`), and evaluates on the validation split only.
+on its FeatureSet train split with a local, sequential search — random by
+default, or a grid with `searcher: grid` (`num_trials`, `time_limit_seconds`) —
+and evaluates on the validation split only.
 Bagging, stacking, weighted ensembles, GPUs, and test data stay off. Params you
 fix in a model's `params` stay fixed; the rest of AutoGluon's default search
 space is tuned. Families `tune` cannot tune — RF and XT without a declared
@@ -206,8 +217,8 @@ carry the selected model's spaces.
 
 RF and XT **with** a `search_space` are tuned (`hpo_effective: true`) instead of
 carried over. Changing a `search_space` never makes `train` stale (training
-ignores it), but it makes the tuning artifacts stale for `tune` and `finalize`,
-and a final model stale if the *selected* model's search space changed.
+ignores it), but it makes the tuning artifacts stale, so `finalize` refuses and
+the final model is stale too (see "When is the final model stale?").
 
 The random searcher tries each range's `default` in its first trial, then samples
 at random. When you omit `default`, AutoGluon uses `low` for `real`/`int` and the
@@ -324,6 +335,8 @@ models:
 - **Staleness.** The entrypoint, the input mode and a SHA-256 of the entrypoint
   file are part of the model's record in every artifact, so editing the file (or
   switching `input`) makes `train`, `tune`, `finalize` and the final model stale.
+  The external preprocessor and feature plugins are hashed the same way (see
+  "Source files").
 
 **Cross-validated evaluation.** A single validation holdout is small: on the
 891-row Titanic set it is 134 rows, and differences between FeatureSets on it
@@ -370,6 +383,12 @@ Absent, everything behaves exactly as before. With it:
   train+validation and evaluates the test split once.
 - Changing `evaluation.cv` is part of the config signature, so it makes training
   and tuning artifacts stale.
+- The folds are drawn from the split `split.random_seed` produces, so `train`
+  and `tune` first check the split settings against `.mltool/prepared/` and
+  refuse, before any fit, if `prepare` has not been re-run after a change: a
+  development set reproduced with a different seed would contain prepared test
+  rows. Training also records the split settings and the fold fingerprint, and
+  counts as stale for every candidate once the current folds differ.
 - MLflow records the CV mean, a `<metric>_std`, and each fold's value as a
   `fold_<metric>` series stepped by fold index.
 - Folds run sequentially to bound memory. `train` and `tune` print the total
@@ -443,7 +462,7 @@ exist after preprocessing, must not be the target, must be unique, and a plugin
 may not emit a name that collides with a source column or a plugin input.
 `plugin_inputs` is part of the FeatureSet recipe, so changing it makes the
 feature artifacts stale, and it is honored identically by `features`,
-`finalize`'s refit and each cross-validation fold.
+`finalize`'s refit, each cross-validation fold and `mltool score`.
 
 Two different holdouts are involved. Inside each candidate, AutoGluon picks the
 winning trial on its own internal holdout carved from the train split.
@@ -482,13 +501,11 @@ config. It then:
 A non-bagged AutoGluon fit keeps an internal holdout out of training, so
 `finalize` passes `refit_full`: the same model is retrained with the same
 hyperparameters on every combined row and becomes the predictor's best model
-(`LightGBM_FULL`, for example). It reads the raw dataset, never the persisted
-`.mltool/features/*/test.parquet`. Output goes to `.mltool/final/`
-(`predictor/`, `result.json`, `manifest.json`); its manifest is the only one
-that records `test_data_used: true`. `final-result` is read-only and warns when
-the config or the tuning selection has changed since `finalize`. The refit
-preprocessor and plugin states are not persisted, so the predictor alone cannot
-score raw data yet.
+(`LightGBM_FULL`, for example). It reads the raw dataset and rebuilds the test
+features itself. Output goes to `.mltool/final/` (`predictor/`,
+`preprocessor.pkl`, `feature_plugins/`, `result.json`, `manifest.json`); its
+manifest is the only one that records `test_data_used: true`. `final-result` is
+read-only and warns when the final model is stale.
 
 `finalize` refuses to run when `.mltool/final/manifest.json` already exists,
 because every run evaluates the test split again. Run `mltool register` first
@@ -523,25 +540,57 @@ compute.
   registering before each `finalize --force` keeps the history.
 - `status` shows per-phase artifact freshness and the last run of each command,
   `logs [--limit N]` the run history (newest first), and `best` the finalized
-  model plus the latest registered version. None of them write anything.
+  model plus the latest registered version. None of them write anything. A
+  phase built on a stale or missing upstream phase is shown stale as well, and
+  `register` is fresh only when the latest registry version is the current final
+  model and that model is fresh.
 
 Feature artifacts are fingerprinted against `.mltool/prepared/`'s parquet files,
 not just against the raw dataset, so re-running `prepare` alone (a changed
 `split.random_seed` or ratio leaves the raw file untouched) marks them stale and
 `plan`, `train`, `tune` and `finalize` all refuse until `mltool features` is run
-again. `.mltool/prepared/` must therefore stay in place for those commands.
+again. The other way round, changing a split or preprocessing setting (or the
+preprocessor file) *without* re-running `prepare` makes `prepare` stale, and
+`features`, `plan`, `train`, `tune` and `finalize` all refuse until `mltool
+prepare` is run again. `.mltool/prepared/` must therefore stay in place for
+those commands.
 
 **Migration note:** a project whose `.mltool/features/manifest.json` was written
 before this fingerprint existed reports "feature artifacts are stale ... predates
 prepared-artifact fingerprinting". Run `mltool features` once to re-materialize;
 nothing else needs changing.
 
-`finalize` records the fingerprints it relied on, so `final-result`, `best` and
-`status` report the final model as stale once the dataset, the prepared
-artifacts or the selected FeatureSet change underneath it, instead of printing a
-superseded test metric as current. `register` refuses a stale final model unless
-given `--force`, and a forced registration records the warning it overrode in
-`metadata.json` (never `null`) together with `forced: true`.
+**When is the final model stale?** One rule: the final model is stale if and
+only if `finalize --force` would refuse on the current config and inputs, or it
+was not built from the inputs `finalize` would use now (a later `prepare`,
+`features` or `tune`, recorded by fingerprint: the dataset, the prepared
+artifacts, the exact tuning manifest and `selected.json`, the selected
+FeatureSet's bytes and recipe). There is no separate list of config fields:
+anything that makes `finalize` refuse — split or preprocessing settings, any
+model, search space, `hpo` setting (`num_trials`, `searcher`, ...), seed, CV
+setting, FeatureSet recipe, or a source file — makes the final model stale.
+That includes a change to a FeatureSet or model that was *not* selected: the
+selection was made by comparing against it. `final-result`, `best` and `status`
+report the reason instead of presenting a superseded test metric as current.
+`register` refuses a stale final model unless given `--force`, and a forced
+registration records the warning it overrode in `metadata.json` (never `null`)
+together with `forced: true`.
+
+**What is not in any signature.** `training.time_limit_seconds`,
+`training.memory_limit_gb` and `training.num_cpus` never make an artifact stale.
+They bound how long and on how much hardware a fit runs, not what it is asked to
+compute: with a seed, a fit that finishes well inside its limits produces the
+same model under a larger limit, so making every artifact stale when a machine
+gets more memory or a longer budget would force re-runs that change nothing.
+Two cases do change results, and MLTool cannot detect either: a fit the time or
+memory limit actually cuts short (AutoGluon stops adding trees, or skips a
+model), whose result then depends on machine speed; and a different CPU count,
+which can change floating-point summation order in multithreaded libraries such
+as LightGBM, so scores may differ in the last digits. Check the AutoGluon log
+for time-limit and memory warnings when comparing runs; the effective limits are
+recorded as `resource_limits` in every manifest for that purpose.
+`hpo.time_limit_seconds` is different: it is part of the tuning signature,
+because a search budget routinely decides how many trials run.
 
 `final-result` and `best` state whether the selected family was really tuned:
 families with no AutoGluon search space (RF, XT) print
@@ -552,14 +601,63 @@ its manifest, the registry `metadata.json` and the final MLflow run's tags.
 each candidate to the MLflow run that recorded it.
 
 Changing the raw dataset invalidates prepared input and requires another
-`mltool prepare`. Phase 2 does not currently fingerprint external preprocessor
-source code, so changing that code also requires the user to rerun preparation.
+`mltool prepare`.
+
+**Source files.** `finalize` and every cross-validation fold execute the
+external preprocessor and the feature plugins as their files are *now*, so their
+code is tracked like a SKLEARN model file: `prepare` records a SHA-256 of the
+preprocessor's entrypoint file, and each FeatureSet recipe records one per
+plugin. Editing the preprocessor makes `prepare` and everything after it stale;
+editing a plugin makes the FeatureSets that use it, and everything after them,
+stale. Only the entrypoint file is hashed: a sibling module it imports is not
+tracked, and is not saved by value either, so keep a preprocessor or plugin in
+one file plus installed packages.
+
+**Migration note (Phase 12).** Artifacts written before these records existed
+are stale only where equivalence cannot be proven: prepared data from a project
+with an external preprocessor (run `mltool prepare`), FeatureSets with plugins
+(`mltool features`), training runs that used either (`mltool train`), and every
+final model (`mltool finalize --force`, then `mltool register`: older registry
+versions cannot be used by `mltool score`). A project without a preprocessor or
+plugins keeps its prepared, feature, training and tuning artifacts, and only
+needs `mltool finalize --force` and `mltool register`.
+
+**Scoring raw rows: `mltool score`.**
+
+```bash
+mltool score --input new_rows.csv --output predictions.csv   # latest version
+mltool score --input new_rows.parquet --output out.parquet --version 3 \
+             --registry /somewhere/else/registry
+```
+
+A registry version is self-contained: `finalize` records in its result and
+manifest a `scoring` block with the target, task and `positive_class`, the raw
+columns the preprocessor was fit on, and the selected FeatureSet's
+`source_columns`, `plugin_inputs`, plugin order and generated columns.
+`score` replays exactly what `finalize` fitted — the preprocessor, then each
+plugin on `source_columns` plus `plugin_inputs`, then the predictor — using only
+that version's files. It never reads `mltool.yaml`, `.mltool/final` or your
+source files (the fitted preprocessor and plugins were saved with their code by
+value), and works from any directory given `--registry` (default
+`./.mltool/registry`). The input needs the columns the first stage reads (the
+preprocessor's training columns, or else the FeatureSet's); a missing one is a
+clear error, and a target column in the input is ignored. The output has the
+row identifiers declared in `data.id_columns` when the input has them, a
+`prediction` column, and one `proba_<class>` column per class for
+classification. `data.id_columns` (optional, default none) only affects this
+output; to keep an identifier out of the features, list `source_columns`
+explicitly instead of `"*"`. `score` writes nothing but its output file, so it
+is not recorded in the run history. All recorded artifact paths are relative to
+the directory of the file that records them, so a project or registry version
+can be moved or copied.
 
 The validation command exits with `0` for a valid project, `2` for expected
 configuration or dataset errors, and `1` for an unexpected runtime failure.
 
-MLTool currently includes Phase 1 validation, Phase 2 preparation, Phase 3
-feature materialization, and Phase 4 isolated candidate training/leaderboards.
-Phase 5 adds HPO on the top candidates and selection of one configuration, Phase 6 refits that configuration on train+validation and evaluates it on the
-test split, and Phase 7 adds SQLite run state, MLflow tracking and a local model
-registry.
+Phases: 1 validation, 2 preparation, 3 feature materialization, 4 candidate
+training, 5 HPO and selection, 6 the final refit and test evaluation, 7 run
+state, MLflow tracking and the registry, 8 ENSEMBLE candidates, 9
+cross-validation and `plugin_inputs`, 10 search spaces, the searcher seed and
+the trial tie-break, 11 SKLEARN custom models, 12 the audit fixes (split
+validation for CV, source hashing, one final-staleness rule, a self-contained
+registry and `mltool score`).

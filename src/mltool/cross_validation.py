@@ -37,9 +37,8 @@ from mltool.data import DataLoadError, load_dataset
 from mltool.evaluation import evaluate_predictions
 from mltool.feature_materialization import (
     FeatureMaterializationError,
-    _fingerprint,
-    _read_manifest,
     build_feature_set_from_frames,
+    validate_prepared_manifest,
 )
 from mltool.feature_plugins import FeaturePluginError
 from mltool.preprocessing import PreprocessingError, preprocess_frames
@@ -150,26 +149,20 @@ def build_cv_plan(config: MLToolConfig) -> CvPlan:
     """Reproduce the development split and lay out the folds.
 
     The split is reproduced with the same function, config and seed ``finalize``
-    uses, then checked against the prepared manifest, so CV scores and the final
-    refit are built from exactly the same rows.
+    uses, so CV scores and the final refit are built from exactly the same rows.
+    Before that, the current split settings must be the ones ``prepare`` used:
+    reproducing the split with a different seed would put prepared test rows
+    into the development set, and the row counts alone cannot tell.
     """
     cv = config.evaluation.cv
     if cv is None:
         raise CrossValidationError("cross-validation is not configured")
 
     try:
-        manifest = _read_manifest(config.config_path.parent / ".mltool/prepared/manifest.json")
-        current_fingerprint = _fingerprint(config.data.path)
+        manifest = validate_prepared_manifest(config)
     except FeatureMaterializationError as exc:
         raise CrossValidationError(str(exc)) from exc
-    source = manifest.get("source")
-    recorded = manifest.get("split")
-    if not isinstance(source, dict) or not isinstance(recorded, dict):
-        raise CrossValidationError('prepared manifest is invalid; run "mltool prepare" again')
-    if source.get("fingerprint") != current_fingerprint:
-        raise CrossValidationError(
-            'configured source dataset changed after preparation; run "mltool prepare" again'
-        )
+    recorded = manifest["split"]
 
     try:
         dataset = load_dataset(config.data)

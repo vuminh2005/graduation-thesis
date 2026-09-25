@@ -14,13 +14,14 @@ import cloudpickle
 import pandas as pd
 
 from mltool.autogluon_adapter import AutoGluonAdapter, AutoGluonError
-from mltool.config import MLToolConfig, model_record
+from mltool.config import ConfigError, MLToolConfig, model_record, relative_path
 from mltool.data import DataLoadError, load_dataset
 from mltool.feature_plugins import FeaturePluginError
 from mltool.evaluation import EvaluationError, evaluate_predictions
 from mltool.experiment import (
     ExperimentError,
     ExperimentPlan,
+    build_experiment_plan,
     current_feature_set_recipe,
     recipe_fingerprint,
     sha256_file,
@@ -28,12 +29,12 @@ from mltool.experiment import (
 from mltool.feature_materialization import (
     FeatureMaterializationError,
     _fingerprint,
-    _read_manifest,
     build_feature_set_from_frames,
     prepared_artifacts_fingerprint,
+    validate_prepared_manifest,
 )
 from mltool.preprocessing import PreprocessingError, preprocess_frames
-from mltool.splitting import SplitError, should_stratify, split_dataset
+from mltool.splitting import SplitError, split_dataset
 from mltool.build_info import mltool_commit
 from mltool.resources import resolve_resource_limits
 from mltool.training import (
@@ -275,37 +276,9 @@ def load_finalize_input(plan: ExperimentPlan) -> FinalizeInput:
 
 def _validate_prepared_manifest(config: MLToolConfig) -> dict[str, Any]:
     try:
-        manifest = _read_manifest(config.config_path.parent / ".mltool/prepared/manifest.json")
-        current_fingerprint = _fingerprint(config.data.path)
+        return validate_prepared_manifest(config)
     except FeatureMaterializationError as exc:
         raise FinalizeError(str(exc)) from exc
-    source = manifest.get("source")
-    split = manifest.get("split")
-    task = manifest.get("task")
-    preprocessing = manifest.get("preprocessing")
-    if not all(isinstance(part, dict) for part in (source, split, task, preprocessing)):
-        raise _stale("prepared manifest is invalid", "prepare")
-    if source.get("fingerprint") != current_fingerprint:
-        raise _stale("configured source dataset changed after preparation", "prepare")
-    if task != {"type": config.task.type, "target": config.task.target}:
-        raise _stale("prepared task/target differs from the current config", "prepare")
-    if (
-        split.get("random_seed") != config.split.random_seed
-        or split.get("requested_validation_ratio") != config.split.validation_ratio
-        or split.get("requested_test_ratio") != config.split.test_ratio
-        or split.get("stratified") != should_stratify(config.task.type, config.split.stratify)
-    ):
-        raise _stale("split configuration differs from the prepared split", "prepare")
-    external = config.preprocessing.external
-    if preprocessing.get("enabled") != external.enabled or (
-        external.enabled
-        and (
-            preprocessing.get("entrypoint") != external.entrypoint
-            or preprocessing.get("params") != external.params
-        )
-    ):
-        raise _stale("preprocessing configuration differs from the prepared data", "prepare")
-    return manifest
 
 
 def _reproduce_raw_splits(config: MLToolConfig, prepared_manifest: dict[str, Any]):
@@ -332,6 +305,48 @@ def _reproduce_raw_splits(config: MLToolConfig, prepared_manifest: dict[str, Any
             f'test {len(splits.test)} vs {recorded["test_rows"]}; run "mltool prepare" again'
         )
     return splits
+
+
+def scoring_record(
+    config: MLToolConfig,
+    *,
+    raw_feature_columns: list[str],
+    feature_set: dict[str, Any],
+    preprocessor_artifact: str | None,
+    plugin_artifacts: dict[str, str],
+    positive_class: Any,
+) -> dict[str, Any]:
+    """Everything ``mltool score`` needs to turn raw rows into predictions.
+
+    Stored in the final result and manifest, so a registry version is enough on
+    its own: the preprocessor sees ``raw_feature_columns`` (the columns it was fit
+    on), each plugin in order sees ``source_columns`` plus ``plugin_inputs``, and
+    the predictor gets ``final_feature_columns``. Paths are relative to the
+    directory holding the record.
+    """
+    return {
+        "task": config.task.type,
+        "target": config.task.target,
+        "positive_class": positive_class,
+        "id_columns": list(config.data.id_columns),
+        "raw_feature_columns": raw_feature_columns,
+        "preprocessor": preprocessor_artifact,
+        "feature_set": {
+            "name": feature_set["name"],
+            "source_columns": feature_set["source_columns"],
+            "plugin_inputs": feature_set["plugin_inputs"],
+            "plugins": [
+                {
+                    "name": plugin["name"],
+                    "artifact": plugin_artifacts[plugin["name"]],
+                    "generated_columns": plugin["generated_columns"],
+                }
+                for plugin in feature_set["plugins"]
+            ],
+            "final_feature_columns": feature_set["final_feature_columns"],
+        },
+        "predictor": "predictor",
+    }
 
 
 def finalize_experiment(
@@ -401,13 +416,14 @@ def finalize_experiment(
     adapter = (adapter_factory or AutoGluonAdapter)()
     try:
         # Persist refit transform state first: a serialization failure must abort
-        # before the test split is ever evaluated.
+        # before the test split is ever evaluated. Artifact paths are relative to
+        # .mltool/final/, so they stay valid in every registry copy.
         preprocessor_artifact = None
         if preprocessed.fitted_preprocessor is not None:
             _dump_fitted(
                 preprocessed.fitted_preprocessor, staging / "preprocessor.pkl", "preprocessor"
             )
-            preprocessor_artifact = str(output_path / "preprocessor.pkl")
+            preprocessor_artifact = "preprocessor.pkl"
         plugin_artifacts: dict[str, str] = {}
         if materialized.fitted_plugins:
             (staging / "feature_plugins").mkdir()
@@ -416,9 +432,7 @@ def finalize_experiment(
                 fitted_plugin, staging / "feature_plugins" / f"{plugin_name}.pkl",
                 f'feature plugin "{plugin_name}"',
             )
-            plugin_artifacts[plugin_name] = str(
-                output_path / "feature_plugins" / f"{plugin_name}.pkl"
-            )
+            plugin_artifacts[plugin_name] = f"feature_plugins/{plugin_name}.pkl"
 
         # One fixed-hyperparameter fit and one test inference/evaluation, no fallback.
         try:
@@ -445,6 +459,14 @@ def finalize_experiment(
             raise FinalizeError(f"final refit failed: {exc}") from exc
 
         elapsed = float(time.perf_counter() - started)
+        scoring = scoring_record(
+            config,
+            raw_feature_columns=[column for column in combined.columns if column != target],
+            feature_set=materialized.manifest,
+            preprocessor_artifact=preprocessor_artifact,
+            plugin_artifacts=plugin_artifacts,
+            positive_class=output.positive_class,
+        )
         result = {
             "status": "SUCCEEDED",
             "candidate_id": candidate.candidate_id,
@@ -493,8 +515,9 @@ def finalize_experiment(
             "best_model": output.best_model,
             "trained_models": output.trained_models,
             "training_seconds": elapsed,
-            "predictor_path": str(output_path / "predictor"),
+            "predictor_path": "predictor",
             "autogluon_version": output.autogluon_version,
+            "scoring": scoring,
         }
         _write_json(staging / "result.json", result)
         manifest = {
@@ -537,13 +560,21 @@ def finalize_experiment(
             "prepared_artifacts_fingerprint": prepared_artifacts_fingerprint(
                 project_root / ".mltool/prepared"
             ),
-            "tuning_manifest": str(project_root / ".mltool/tuning/manifest.json"),
-            "tuning_selected": str(project_root / ".mltool/tuning/selected.json"),
+            "tuning_manifest": relative_path(
+                project_root / ".mltool/tuning/manifest.json", output_path
+            ),
+            "tuning_selected": relative_path(
+                project_root / ".mltool/tuning/selected.json", output_path
+            ),
+            # the exact tuning artifacts this model was built from
+            "tuning_manifest_sha256": sha256_file(project_root / ".mltool/tuning/manifest.json"),
+            "tuning_selected_sha256": sha256_file(project_root / ".mltool/tuning/selected.json"),
             "artifacts": {
-                "predictor": str(output_path / "predictor"),
+                "predictor": "predictor",
                 "preprocessor": preprocessor_artifact,
                 "feature_plugins": plugin_artifacts,
             },
+            "scoring": scoring,
             "test_evaluations": 1,
             "test_data_used": True,
         }
@@ -565,11 +596,12 @@ def finalize_experiment(
     )
 
 
-def _upstream_staleness(config: MLToolConfig, manifest: dict[str, Any]) -> str | None:
-    """Has anything this final model was built from changed since it was created?
+def _provenance_staleness(config: MLToolConfig, manifest: dict[str, Any]) -> str | None:
+    """Was this final model built from the artifacts that are current now?
 
-    Mirrors the depth of ``tune``'s check against ``train``: raw dataset, the
-    prepared artifacts, and the selected FeatureSet's own parquet bytes.
+    Raw dataset, prepared artifacts, the exact tuning artifacts it was built
+    from, and the selected FeatureSet's bytes and recipe. A record missing from
+    an older manifest cannot prove it, so it counts as stale.
     """
     root = config.config_path.parent
     try:
@@ -583,6 +615,18 @@ def _upstream_staleness(config: MLToolConfig, manifest: dict[str, Any]) -> str |
     except FeatureMaterializationError as exc:
         return str(exc)
 
+    for key, name in (("tuning_manifest_sha256", "manifest.json"), ("tuning_selected_sha256", "selected.json")):
+        recorded = manifest.get(key)
+        if not isinstance(recorded, str) or not recorded:
+            return "this final model predates tuning-artifact fingerprinting"
+        path = root / ".mltool/tuning" / name
+        try:
+            current = sha256_file(path) if path.is_file() else None
+        except ExperimentError as exc:
+            return str(exc)
+        if current != recorded:
+            return "the current tuning selection differs from the one used for this final model"
+
     recorded_features = manifest.get("feature_artifacts")
     if not isinstance(recorded_features, dict) or not recorded_features:
         return "this final model predates feature-artifact fingerprinting"
@@ -590,20 +634,21 @@ def _upstream_staleness(config: MLToolConfig, manifest: dict[str, Any]) -> str |
     if not isinstance(selected, dict) or not isinstance(selected.get("feature_set"), str):
         return "this final model's manifest is invalid"
     set_path = root / ".mltool/features" / selected["feature_set"]
-    current: dict[str, Any] = {}
+    current_features: dict[str, Any] = {}
     for split_name in ("train", "validation"):
         path = set_path / f"{split_name}.parquet"
         if not path.is_file():
             return f"the selected FeatureSet artifact is missing: {path}"
         try:
-            current[f"{split_name}_sha256"] = sha256_file(path)
+            current_features[f"{split_name}_sha256"] = sha256_file(path)
         except ExperimentError as exc:
             return str(exc)
-    if current != recorded_features:
+    if current_features != recorded_features:
         return "the selected FeatureSet was re-materialized after this final model was created"
 
     # The parquet bytes above only prove features/ was not rebuilt. A recipe
-    # edit that has not been re-materialized yet leaves them untouched.
+    # edit (or a plugin source edit) that has not been re-materialized yet
+    # leaves them untouched.
     recorded_recipe = manifest.get("selected_feature_set_recipe")
     if not isinstance(recorded_recipe, str) or not recorded_recipe:
         return "this final model predates feature-set recipe fingerprinting"
@@ -615,6 +660,39 @@ def _upstream_staleness(config: MLToolConfig, manifest: dict[str, Any]) -> str |
         return str(exc)
     if current_recipe != recorded_recipe:
         return "the selected feature set's recipe changed after this final model was created"
+    return None
+
+
+def finalize_refusal(config: MLToolConfig) -> str | None:
+    """Why ``finalize --force`` would refuse to run now, or None if it would run.
+
+    Exactly the checks ``finalize`` makes before its refit: the plan (config,
+    prepared and feature artifacts) and ``load_finalize_input`` (training,
+    tuning, selection, prepared manifest).
+    """
+    try:
+        load_finalize_input(build_experiment_plan(config))
+    except (ConfigError, ExperimentError, TrainingError, TuningError, FinalizeError) as exc:
+        return str(exc)
+    return None
+
+
+def final_model_staleness(config: MLToolConfig, manifest: dict[str, Any]) -> str | None:
+    """The one rule for whether ``.mltool/final`` is current.
+
+    Stale if and only if ``finalize`` would refuse on the current config and
+    inputs, or the final model was not built from the inputs finalize would use
+    now (a later ``tune``, ``features`` or ``prepare``). There is no separate
+    list of config comparisons: everything the config can change is covered by
+    finalize's own checks. ``final-result``, ``best``, ``status`` and
+    ``register`` all read this.
+    """
+    reason = _provenance_staleness(config, manifest)
+    if reason is not None:
+        return reason
+    refusal = finalize_refusal(config)
+    if refusal is not None:
+        return f"finalize would refuse on the current config and inputs: {refusal}"
     return None
 
 
@@ -631,45 +709,6 @@ def load_persisted_final(config: MLToolConfig) -> PersistedFinal:
         raise FinalizeError(f"final artifacts are unreadable: {exc}") from exc
     if not isinstance(manifest, dict) or not isinstance(result, dict):
         raise FinalizeError('final artifacts are invalid; run "mltool finalize" again')
-    signature = {
-        "task": manifest.get("task"),
-        "target": manifest.get("target"),
-        "primary_metric": manifest.get("primary_metric"),
-        "secondary_metrics": manifest.get("secondary_metrics"),
-        "cv": _manifest_cv_signature(manifest),
-        "feature_sets": [
-            entry.get("name") for entry in manifest.get("feature_sets", [])
-            if isinstance(entry, dict)
-        ],
-        "models": manifest.get("models"),
-    }
-    warning = _upstream_staleness(config, manifest)
-    if warning is not None:
-        return PersistedFinal(manifest=manifest, result=result, warning=warning)
-    selected_model = next(
-        (m for m in config.models if m.name == manifest["selected"].get("model", {}).get("name")),
-        None,
+    return PersistedFinal(
+        manifest=manifest, result=result, warning=final_model_staleness(config, manifest)
     )
-    if signature != _config_signature(config) or manifest.get("seed") != config.training.seed:
-        warning = "current config differs from the config used to create this final model"
-    elif selected_model is not None and manifest["selected"].get(
-        "search_space", {}
-    ) != selected_model.search_space:
-        # A final model written before search spaces existed searched none.
-        warning = "the selected model's search space changed after this final model was created"
-    else:
-        try:
-            current = json.loads(
-                (config.config_path.parent / ".mltool/tuning/selected.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-        except (OSError, json.JSONDecodeError):
-            current = None
-        if current is None or current.get("candidate_id") != manifest["selected"].get(
-            "candidate_id"
-        ) or current.get("best_hyperparameters") != manifest["selected"].get(
-            "best_hyperparameters"
-        ):
-            warning = "the current tuning selection differs from the one used for this final model"
-    return PersistedFinal(manifest=manifest, result=result, warning=warning)

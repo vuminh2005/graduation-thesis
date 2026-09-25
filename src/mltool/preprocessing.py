@@ -12,7 +12,7 @@ from typing import Any
 
 import pandas as pd
 
-from mltool.config import ExternalPreprocessingConfig
+from mltool.config import ExternalPreprocessingConfig, source_sha256
 from mltool.splitting import DatasetSplits
 
 
@@ -43,6 +43,20 @@ def _resolve_entrypoint(entrypoint: str, config_path: Path) -> tuple[Path, str]:
     if not plugin_path.is_file():
         raise PreprocessingError(f"external preprocessor file not found: {plugin_path}")
     return plugin_path, class_name.strip()
+
+
+def preprocessor_source_sha256(config: ExternalPreprocessingConfig, config_path: Path) -> str | None:
+    """SHA-256 of the preprocessor's entrypoint file; None if disabled or unreadable.
+
+    Only that one file is hashed: a sibling module it imports is not tracked.
+    """
+    if not config.enabled or config.entrypoint is None:
+        return None
+    try:
+        path, _ = _resolve_entrypoint(config.entrypoint, config_path)
+    except PreprocessingError:
+        return None
+    return source_sha256(path)
 
 
 def load_external_preprocessor(

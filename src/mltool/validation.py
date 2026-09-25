@@ -59,6 +59,10 @@ def validate_dataset(config: MLToolConfig, dataset: LoadedDataset) -> Validation
         names = ", ".join(f'"{name}"' for name in duplicates)
         report.errors.append(f"duplicate column names found: {names}")
 
+    for column in config.data.id_columns:
+        if column not in dataset.column_names:
+            report.errors.append(f'id column "{column}" (data.id_columns) was not found')
+
     target_name = config.task.target
     if target_name not in dataset.column_names:
         report.errors.append(f'target column "{target_name}" was not found')

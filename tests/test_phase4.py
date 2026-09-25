@@ -272,7 +272,8 @@ def test_changed_raw_source_fingerprint_is_detected(tmp_path: Path) -> None:
     path = materialize(tmp_path)
     with (tmp_path / "data/dataset.csv").open("a", encoding="utf-8") as stream:
         stream.write("100,2,0\n")
-    with pytest.raises(ExperimentError, match="fingerprint changed"):
+    # caught one phase earlier since Phase 12: prepare itself is stale
+    with pytest.raises(ExperimentError, match="source dataset changed.*mltool prepare"):
         build_experiment_plan(load_config(path))
 
 

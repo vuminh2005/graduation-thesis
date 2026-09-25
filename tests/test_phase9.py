@@ -259,7 +259,7 @@ def test_without_cv_everything_matches_phase8(tmp_path: Path) -> None:
 
     stored = json.loads((tmp_path / ".mltool/training/candidates/base__gbm/result.json").read_text())
     assert "cv" not in stored and "predictor_persisted" not in stored
-    assert stored["predictor_path"].endswith("candidates/base__gbm/predictor")
+    assert stored["predictor_path"] == "predictor"  # relative to the candidate directory
     assert (tmp_path / ".mltool/training/candidates/base__gbm/predictor/fake.txt").is_file()
     manifest = json.loads((tmp_path / ".mltool/training/manifest.json").read_text())
     assert "cv" not in manifest

@@ -235,7 +235,7 @@ def test_tune_persists_artifacts_selects_best_and_never_reads_test(
         assert stored["best_hyperparameters"]["learning_rate"] == 0.05
         assert stored["hpo"]["num_trials"] == 4
         assert (candidate_dir / "predictor/fake.txt").is_file()
-        assert stored["predictor_path"] == str(candidate_dir / "predictor")
+        assert stored["predictor_path"] == "predictor"  # relative to candidate_dir
     manifest = json.loads((out / "manifest.json").read_text())
     assert manifest["test_data_used"] is False
     assert manifest["hpo"]["time_limit_seconds"] == 30

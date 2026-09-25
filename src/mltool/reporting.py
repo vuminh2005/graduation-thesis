@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from mltool.config import MLToolConfig
-from mltool.experiment import ExperimentError, build_experiment_plan, load_feature_artifacts
+from mltool.experiment import ExperimentError, build_experiment_plan, load_feature_artifacts, sha256_file
 from mltool.finalize import (
     FinalizeError,
     _validate_prepared_manifest,
@@ -15,7 +15,7 @@ from mltool.finalize import (
     load_persisted_final,
     tuned_line,
 )
-from mltool.registry import RegistryError, list_versions, load_metadata
+from mltool.registry import RegistryError, list_versions, load_metadata, registry_path
 from mltool.state import RunRecord, last_run_per_command, list_runs
 from mltool.training import TrainingError
 from mltool.tuning import TuningError, _read_training_artifacts, _validate_training_freshness
@@ -83,10 +83,47 @@ def _phase_states(config: MLToolConfig) -> dict[str, tuple[str, str]]:
         except FinalizeError as exc:
             states["finalize"] = ("stale", str(exc))
 
-    versions = list_versions(config.config_path.parent)
-    states["register"] = (
-        ("fresh", f"{len(versions)} version(s), latest {versions[-1]}") if versions else ("missing", "")
-    )
+    states["register"] = _register_state(config, states["finalize"])
+    return _propagate(states)
+
+
+def _register_state(config: MLToolConfig, final_state: tuple[str, str]) -> tuple[str, str]:
+    """Fresh only if the latest version is the current final model and that model is fresh."""
+    root = config.config_path.parent
+    versions = list_versions(root)
+    if not versions:
+        return ("missing", "")
+    latest = versions[-1]
+    final_manifest = root / ".mltool/final/manifest.json"
+    registered_manifest = registry_path(root) / str(latest) / "manifest.json"
+    try:
+        same = (
+            final_manifest.is_file()
+            and registered_manifest.is_file()
+            and sha256_file(final_manifest) == sha256_file(registered_manifest)
+        )
+    except ExperimentError as exc:
+        return ("stale", str(exc))
+    if not same:
+        return ("stale", f'latest version {latest} is not the current final model; run "mltool register"')
+    if final_state[0] != "fresh":
+        return ("stale", f"latest version {latest} is the current final model, which is stale")
+    return ("fresh", f"{len(versions)} version(s), latest {latest}")
+
+
+# The phases whose artifacts build on each other, upstream first.
+ARTIFACT_CHAIN = ["prepare", "features", "train", "tune", "finalize", "register"]
+
+
+def _propagate(states: dict[str, tuple[str, str]]) -> dict[str, tuple[str, str]]:
+    """A phase built on a stale or missing upstream phase is shown stale too."""
+    upstream: tuple[str, str] | None = None  # (phase, state) of the first non-fresh phase
+    for phase in ARTIFACT_CHAIN:
+        state, _ = states[phase]
+        if upstream is not None and state == "fresh":
+            states[phase] = ("stale", f"upstream {upstream[0]} is {upstream[1]}")
+        elif upstream is None and state != "fresh":
+            upstream = (phase, state)
     return states
 
 

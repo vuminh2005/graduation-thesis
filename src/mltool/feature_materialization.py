@@ -13,11 +13,14 @@ from uuid import uuid4
 
 import pandas as pd
 
-from mltool.config import FeaturePluginConfig, FeatureSetConfig, MLToolConfig
+from mltool.config import FeaturePluginConfig, FeatureSetConfig, MLToolConfig, relative_path
 from mltool.feature_plugins import (
     FeaturePluginError,
     fit_and_generate_features,
+    plugin_source_sha256,
 )
+from mltool.preprocessing import preprocessor_source_sha256
+from mltool.splitting import should_stratify
 
 
 class FeatureMaterializationError(ValueError):
@@ -176,32 +179,69 @@ def _read_manifest(path: Path) -> dict[str, Any]:
     return value
 
 
+class PreparedArtifactsStale(FeatureMaterializationError):
+    """``.mltool/prepared/`` no longer matches the current config or source files."""
+
+
+def _prepared_stale(message: str) -> PreparedArtifactsStale:
+    return PreparedArtifactsStale(
+        f'prepared artifacts are stale ({message}); run "mltool prepare" again'
+    )
+
+
+def validate_prepared_manifest(config: MLToolConfig) -> dict[str, Any]:
+    """Whether ``prepare`` is fresh: the one check every later phase builds on.
+
+    ``features``, ``plan`` (hence ``train``, ``tune`` and ``finalize``), the
+    cross-validation split and ``status`` all call it, so a changed dataset,
+    task, split setting, preprocessing setting or preprocessor source file is
+    refused before anything is built on the old preparation.
+    """
+    manifest = _read_manifest(config.config_path.parent / ".mltool/prepared/manifest.json")
+    current_fingerprint = _fingerprint(config.data.path)
+    source = manifest.get("source")
+    split = manifest.get("split")
+    task = manifest.get("task")
+    preprocessing = manifest.get("preprocessing")
+    if not all(isinstance(part, dict) for part in (source, split, task, preprocessing)):
+        raise _prepared_stale("prepared manifest is invalid")
+    if source.get("fingerprint") != current_fingerprint:
+        raise _prepared_stale("configured source dataset changed after preparation")
+    if task != {"type": config.task.type, "target": config.task.target}:
+        raise _prepared_stale("prepared task/target differs from the current config")
+    if (
+        split.get("random_seed") != config.split.random_seed
+        or split.get("requested_validation_ratio") != config.split.validation_ratio
+        or split.get("requested_test_ratio") != config.split.test_ratio
+        or split.get("stratified") != should_stratify(config.task.type, config.split.stratify)
+    ):
+        raise _prepared_stale("split configuration differs from the prepared split")
+    external = config.preprocessing.external
+    if preprocessing.get("enabled") != external.enabled or (
+        external.enabled
+        and (
+            preprocessing.get("entrypoint") != external.entrypoint
+            or preprocessing.get("params") != external.params
+        )
+    ):
+        raise _prepared_stale("preprocessing configuration differs from the prepared data")
+    if external.enabled:
+        # A manifest without the hash cannot prove which preprocessor code ran.
+        recorded = preprocessing.get("source_sha256")
+        if not isinstance(recorded, str) or not recorded:
+            raise _prepared_stale("the prepared data predates preprocessor source hashing")
+        if recorded != preprocessor_source_sha256(external, config.config_path):
+            raise _prepared_stale(
+                "the external preprocessor source file changed after preparation"
+            )
+    return manifest
+
+
 def load_prepared_feature_input(config: MLToolConfig) -> PreparedFeatureInput:
     prepared_path = config.config_path.parent / ".mltool/prepared"
     manifest_path = prepared_path / "manifest.json"
-    manifest = _read_manifest(manifest_path)
-
-    manifest_task = manifest.get("task")
-    if not isinstance(manifest_task, dict) or (
-        manifest_task.get("type") != config.task.type
-        or manifest_task.get("target") != config.task.target
-    ):
-        raise FeatureMaterializationError(
-            'prepared task/target does not match the current config; run "mltool prepare" again'
-        )
-    manifest_source = manifest.get("source")
-    prepared_fingerprint = (
-        manifest_source.get("fingerprint") if isinstance(manifest_source, dict) else None
-    )
-    if not isinstance(prepared_fingerprint, str) or not prepared_fingerprint:
-        raise FeatureMaterializationError(
-            'prepared manifest has no source fingerprint; run "mltool prepare" again'
-        )
-    current_fingerprint = _fingerprint(config.data.path)
-    if current_fingerprint != prepared_fingerprint:
-        raise FeatureMaterializationError(
-            'configured source dataset changed after preparation; run "mltool prepare" again'
-        )
+    manifest = validate_prepared_manifest(config)
+    prepared_fingerprint = manifest["source"]["fingerprint"]
 
     frames: dict[str, pd.DataFrame] = {}
     for split_name in PREPARED_SPLITS:
@@ -307,12 +347,15 @@ def _plugin_manifest(
     spec: FeaturePluginConfig,
     generated_columns: list[str],
     resolved_entrypoint: str,
+    config_path: Path,
 ) -> dict[str, Any]:
     return {
         "name": spec.name,
         "entrypoint": spec.entrypoint,
         "resolved_entrypoint": resolved_entrypoint,
         "params": spec.params,
+        # editing the plugin file makes this FeatureSet stale
+        "source_sha256": plugin_source_sha256(spec, config_path),
         "generated_columns": generated_columns,
     }
 
@@ -392,7 +435,7 @@ def build_feature_set_from_frames(
         for split_name in split_names:
             generated_by_split[split_name].append(generated_frames[split_name])
         plugin_manifests.append(
-            _plugin_manifest(plugin_spec, generated_columns, resolved_entrypoint)
+            _plugin_manifest(plugin_spec, generated_columns, resolved_entrypoint, config.config_path)
         )
 
     final_feature_columns = list(source_columns)
@@ -478,7 +521,10 @@ def materialize_feature_sets(config: MLToolConfig) -> FeatureMaterializationResu
             materialized = _build_feature_set(config, prepared, spec, catalog)
             set_staging = staging / spec.name
             set_staging.mkdir()
-            for split_name in ("train", "validation", "test"):
+            # The test frame is built (so a plugin that breaks on test rows fails
+            # here, before any fit) but not persisted: nothing reads it, and
+            # finalize rebuilds the test features from the raw rows.
+            for split_name in ("train", "validation"):
                 materialized.frames[split_name].to_parquet(
                     set_staging / f"{split_name}.parquet", index=False
                 )
@@ -489,9 +535,10 @@ def materialize_feature_sets(config: MLToolConfig) -> FeatureMaterializationResu
             feature_sets.append(materialized)
 
         global_manifest = {
+            # paths relative to this manifest's directory
             "prepared_input": {
-                "path": str(prepared.path),
-                "manifest": str(prepared.manifest_path),
+                "path": relative_path(prepared.path, output_path),
+                "manifest": relative_path(prepared.manifest_path, output_path),
             },
             "source_dataset_fingerprint": prepared.source_fingerprint,
             "prepared_artifacts_fingerprint": prepared.artifacts_fingerprint,
@@ -511,7 +558,7 @@ def materialize_feature_sets(config: MLToolConfig) -> FeatureMaterializationResu
             "feature_sets": [
                 {
                     "name": feature_set.name,
-                    "path": str(output_path / feature_set.name),
+                    "path": feature_set.name,
                     "feature_count": feature_set.final_feature_count,
                     "rows": feature_set.rows,
                 }
