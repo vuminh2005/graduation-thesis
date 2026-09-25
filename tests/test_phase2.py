@@ -654,6 +654,7 @@ def test_init_template_contains_only_supported_phase_sections(tmp_path: Path) ->
         "models",
         "evaluation",
         "training",
+        "hpo",  # Phase 13: so a fresh project runs end to end with `mltool run`
     }
     assert raw["split"] == {
         "validation_ratio": 0.15,
@@ -677,3 +678,4 @@ def test_init_template_contains_only_supported_phase_sections(tmp_path: Path) ->
         "secondary_metrics": ["f1", "accuracy"],
     }
     assert raw["training"] == {"time_limit_seconds": None}
+    assert raw["hpo"] == {"top_n": 3, "num_trials": 10, "time_limit_seconds": 300}

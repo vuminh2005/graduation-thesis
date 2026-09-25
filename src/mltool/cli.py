@@ -38,6 +38,7 @@ from mltool.tuning import (
 from mltool import tracking
 from mltool.registry import RegistryBlocked, RegistryError, register_final
 from mltool.reporting import render_best, render_logs, render_status
+from mltool.runner import STEPS, execute, plan_decisions, render_decisions, render_summary
 from mltool.scoring import ScoringError, render_scoring_error, score
 from mltool.state import StateError, TrackedRun
 from mltool.validation import validate_dataset
@@ -179,6 +180,12 @@ evaluation:
 
 training:
   time_limit_seconds: null
+
+# What `tune` searches and how long it may take; `mltool run` needs it too.
+hpo:
+  top_n: 3                   # best training candidates to tune
+  num_trials: 10             # HPO trials per candidate
+  time_limit_seconds: 300    # budget per candidate
 '''
 
 
@@ -189,6 +196,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("init", help="create a minimal MLTool project")
+    run = subparsers.add_parser(
+        "run", help="run every step from validate to register, skipping what is fresh"
+    )
+    run.add_argument("--dry-run", action="store_true",
+                     help="print each step's decision and reason; run nothing")
+    run.add_argument("--until", choices=STEPS, default=None, help="stop after this step")
+    run.add_argument("--refinalize", action="store_true",
+                     help="re-run a stale finalize (evaluates the test split again)")
     subparsers.add_parser("validate", help="validate the configured dataset")
     subparsers.add_parser("prepare", help="validate, split, and prepare the dataset")
     subparsers.add_parser("features", help="materialize configured feature sets")
@@ -570,11 +585,66 @@ def score_project(
     return 0
 
 
+# Looked up at call time, so each step is exactly the command of the same name.
+RUN_STEPS = {
+    "validate": lambda path, **kw: validate_project(path, **kw),
+    "prepare": lambda path, **kw: prepare_project(path, **kw),
+    "features": lambda path, **kw: features_project(path, **kw),
+    "plan": lambda path, **kw: plan_project(path, **kw),
+    "train": lambda path, **kw: train_project(path, **kw),
+    "tune": lambda path, **kw: tune_project(path, **kw),
+    "finalize": lambda path, **kw: finalize_project(path, **kw),
+    "register": lambda path, **kw: register_project(path, **kw),  # never forced
+}
+
+
+def run_project(
+    config_path: Path = Path("mltool.yaml"), *, dry_run: bool = False,
+    until: str | None = None, refinalize: bool = False,
+) -> int:
+    if dry_run:  # writes nothing, so like status it is not recorded
+        try:
+            config = load_config(config_path)
+            print(render_decisions(plan_decisions(config, until=until, refinalize=refinalize)))
+        except (ConfigError, StateError) as exc:
+            print(render_experiment_error("MLTool run", str(exc)))
+            return 2
+        return 0
+    return _run_pipeline(config_path, until=until, refinalize=refinalize)
+
+
+@tracked("run")
+def _run_pipeline(config_path: Path, *, until: str | None, refinalize: bool) -> int:
+    _detail(until=until, refinalize=refinalize)
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        _detail(error=str(exc))
+        print(render_experiment_error("MLTool run", str(exc)))
+        return 2
+    report = execute(config_path, config, RUN_STEPS, until=until, refinalize=refinalize)
+    _detail(**report.details())
+    if report.stopped_at:
+        _detail(blocked=True)
+    elif report.failed_step:
+        _detail(error=f"step {report.failed_step} failed with exit code {report.exit_code}")
+    final = None
+    if (config.config_path.parent / ".mltool/final/manifest.json").is_file():
+        try:
+            final = load_persisted_final(config)
+        except FinalizeError:
+            final = None
+    print(render_summary(config, report, final))
+    return report.exit_code
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "init":
             return init_project()
+        if args.command == "run":
+            return run_project(dry_run=args.dry_run, until=args.until, refinalize=args.refinalize)
         if args.command == "validate":
             return validate_project()
         if args.command == "prepare":

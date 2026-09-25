@@ -13,6 +13,27 @@ No phase before `finalize` fits on, scores on or selects with the test split:
 their contract (the result is not persisted), and later phases open the
 prepared test file only to fingerprint its bytes.
 
+## Quick start
+
+```bash
+mkdir demo && cd demo
+mltool init                       # writes mltool.yaml and data/
+cp /path/to/your.csv data/dataset.csv
+# edit mltool.yaml: task.type (binary / multiclass / regression) and task.target
+mltool run                        # validate -> prepare -> ... -> register
+mltool best                       # what was selected, and its test metrics
+mltool score --input new_rows.csv --output predictions.csv
+```
+
+`init` writes a project that runs end to end as is: every column except the
+target becomes a feature, LightGBM and random forest are compared on a
+validation split, the best three candidates are tuned (`hpo:` section), and the
+winner is refit and evaluated once on the test split. Edit `mltool.yaml` to add
+feature sets, models, cross-validation and so on (below), then `mltool run`
+again: it re-runs only the steps your edit made stale (see "One command:
+`mltool run`"). `mltool` here is `/path/to/graduation-thesis/.venv/bin/mltool`
+after the install below.
+
 ## Install for development
 
 Requires **Python >= 3.12** (matches `pyproject.toml`). The install is large,
@@ -24,7 +45,9 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[test]'
 ```
 
-## Use
+## Use, step by step
+
+`mltool run` calls these commands for you; each can also be run on its own:
 
 ```bash
 mkdir demo && cd demo
@@ -37,10 +60,7 @@ mkdir demo && cd demo
 /path/to/graduation-thesis/.venv/bin/mltool plan
 /path/to/graduation-thesis/.venv/bin/mltool train
 /path/to/graduation-thesis/.venv/bin/mltool leaderboard
-# `tune` needs an `hpo:` section, which `init` does not write. Append this to
-# mltool.yaml first (a per-candidate time budget in seconds is required):
-#   hpo:
-#     time_limit_seconds: 60
+# `tune` needs the `hpo:` section (init writes one)
 /path/to/graduation-thesis/.venv/bin/mltool tune
 /path/to/graduation-thesis/.venv/bin/mltool tuning-leaderboard
 /path/to/graduation-thesis/.venv/bin/mltool finalize
@@ -52,6 +72,49 @@ mkdir demo && cd demo
 # predictions for new raw rows, from the latest registry version only
 /path/to/graduation-thesis/.venv/bin/mltool score --input new_rows.csv --output predictions.csv
 ```
+
+### One command: `mltool run`
+
+```bash
+mltool run                  # every step, skipping what is already fresh
+mltool run --dry-run        # print each step's decision and reason; run nothing
+mltool run --until tune     # stop after a step, e.g. before the test split is touched
+mltool run --refinalize     # also re-run a stale finalize (see below)
+```
+
+`run` goes through validate → prepare → features → plan → train → tune →
+finalize → register, calling the same commands in-process, and decides each
+step from exactly the freshness `mltool status` reports (it re-reads it before
+every step, so a step sees what the steps before it just rewrote):
+
+- `validate` and `plan` always run: they are cheap checks (`validate` is skipped
+  when `validation.enabled` is false; `prepare` still validates the data).
+- `prepare`, `features`, `train`, `tune` run when their artifacts are missing or
+  stale and are skipped when fresh. Editing a model's params re-runs `train`
+  onward; editing a plugin file re-runs `features` onward; editing the
+  preprocessor or a split setting re-runs `prepare` onward.
+- `finalize` runs when there is no final model and is skipped when it is fresh.
+  When a final model exists but is **stale, `run` stops before finalize** and
+  says why. `finalize` evaluates the test split; if every config edit
+  re-evaluated it automatically, the test score would become one more number
+  you iterate on — selecting on test data by another name. Look at the new
+  training and tuning results first (`mltool leaderboard`,
+  `mltool tuning-leaderboard`); when re-evaluating the test split is intended,
+  `mltool run --refinalize` runs `finalize --force`. `--refinalize` does
+  nothing to a fresh final model.
+- `register` is skipped when the latest registry version is already the current,
+  fresh final model, and otherwise registers it. `run` never forces a
+  registration.
+
+The run stops at the first step that fails and exits with that step's exit
+code (a stop before finalize exits 2), then prints a summary: every step's
+decision and duration, the selected configuration, its test metrics, the
+registry version and useful next commands. Each step records its own row in
+`.mltool/state.db` as when run alone, plus one `run` row with the per-step
+decisions (`mltool logs`); a dry run records nothing.
+`--dry-run` reads the state once; a real run can occasionally skip a step the
+dry run listed, when re-running the step before it rewrote byte-identical
+artifacts.
 
 **Input data.** Provide a CSV or Parquet file with one column per feature plus
 exactly one target column whose name matches `task.target` (the `init` template
@@ -145,7 +208,8 @@ result per candidate plus JSON/CSV global leaderboards. `leaderboard` is
 read-only. `features` writes only each FeatureSet's `train.parquet` and
 `validation.parquet`; there is no FeatureSet test file to read.
 
-`tune` (Phase 5) needs an optional `hpo:` section, which `init` does not write:
+`tune` (Phase 5) needs an `hpo:` section; `init` writes one with the defaults
+below, except a 300-second budget:
 
 ```yaml
 hpo:
