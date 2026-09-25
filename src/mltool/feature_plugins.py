@@ -12,7 +12,7 @@ from typing import Any
 
 import pandas as pd
 
-from mltool.config import FeaturePluginConfig, source_sha256
+from mltool.config import FeaturePluginConfig, execute_source, source_sha256
 
 
 class FeaturePluginError(ValueError):
@@ -70,7 +70,7 @@ def load_feature_plugin(
     previous_module = sys.modules.get(module_name)
     sys.modules[module_name] = module
     try:
-        module_spec.loader.exec_module(module)
+        execute_source(module, plugin_path)
     except (Exception, SystemExit) as exc:
         raise FeaturePluginError(
             f"could not load feature plugin module {plugin_path}: {exc}"

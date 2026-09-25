@@ -26,7 +26,7 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 
-from mltool.config import ConfigError, ModelConfig, TrainingConfig, source_sha256
+from mltool.config import ConfigError, ModelConfig, TrainingConfig, execute_source, source_sha256
 
 SKLEARN = "SKLEARN"
 # Hyperparameter keys MLTool adds for the wrapper; never passed to the estimator.
@@ -60,7 +60,7 @@ def load_entrypoint(spec: str) -> Callable[..., Any]:
     previous = sys.modules.get(module_name)
     sys.modules[module_name] = module  # visible while it executes (dataclasses etc.)
     try:
-        module_spec.loader.exec_module(module)
+        execute_source(module, path)
     except (Exception, SystemExit) as exc:
         raise CustomModelError(f"could not load model entrypoint {path}: {exc}") from exc
     finally:

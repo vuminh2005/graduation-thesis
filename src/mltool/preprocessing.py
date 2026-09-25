@@ -12,7 +12,7 @@ from typing import Any
 
 import pandas as pd
 
-from mltool.config import ExternalPreprocessingConfig, source_sha256
+from mltool.config import ExternalPreprocessingConfig, execute_source, source_sha256
 from mltool.splitting import DatasetSplits
 
 
@@ -75,7 +75,7 @@ def load_external_preprocessor(
     previous_module = sys.modules.get(module_name)
     sys.modules[module_name] = module
     try:
-        spec.loader.exec_module(module)
+        execute_source(module, plugin_path)
     except (Exception, SystemExit) as exc:
         raise PreprocessingError(
             f"could not load external preprocessor module {plugin_path}: {exc}"

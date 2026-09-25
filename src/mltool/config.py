@@ -156,6 +156,19 @@ def source_sha256(path: Path | None) -> str | None:
         return None
 
 
+def execute_source(module: Any, path: Path) -> None:
+    """Run a user's file as ``module`` from the bytes it holds now.
+
+    ``SourceFileLoader.exec_module`` would reuse ``__pycache__/*.pyc``, which it
+    validates only by the source's size and mtime in whole seconds: an edit that
+    keeps the size, within the same second, would run the old code while
+    ``source_sha256`` hashes the new file. Compiling the source directly also
+    leaves no ``__pycache__`` in the user's project.
+    """
+    code = compile(Path(path).read_bytes(), str(path), "exec", dont_inherit=True)
+    exec(code, module.__dict__)
+
+
 def relative_path(path: Path | str, start: Path | str) -> str:
     """``path`` as recorded in a manifest: relative to the directory holding that manifest.
 

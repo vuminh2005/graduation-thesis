@@ -611,7 +611,10 @@ plugin. Editing the preprocessor makes `prepare` and everything after it stale;
 editing a plugin makes the FeatureSets that use it, and everything after them,
 stale. Only the entrypoint file is hashed: a sibling module it imports is not
 tracked, and is not saved by value either, so keep a preprocessor or plugin in
-one file plus installed packages.
+one file plus installed packages. User files (these and SKLEARN model files) are executed
+from their current bytes, never from a cached `__pycache__/*.pyc`, so the code
+that runs is always the code that was hashed; MLTool writes no `__pycache__`
+into your project.
 
 **Migration note (Phase 12).** Artifacts written before these records existed
 are stale only where equivalence cannot be proven: prepared data from a project
