@@ -615,8 +615,9 @@ def test_valid_dataset_warnings_are_shown_and_do_not_stop_preparation(
 
     assert prepare_project(config_path) == 0
     output = capsys.readouterr().out
-    assert "VALID with 1 warning" in output
+    assert "VALID with 2 warnings" in output
     assert "1 duplicate row(s) found" in output
+    assert 'column "row_id" is named like an identifier' in output  # Phase 13b
     assert "Result: PREPARED" in output
 
 
@@ -652,10 +653,10 @@ def test_init_template_contains_only_supported_phase_sections(tmp_path: Path) ->
         "preprocessing",
         "features",
         "models",
-        "evaluation",
         "training",
         "hpo",  # Phase 13: so a fresh project runs end to end with `mltool run`
-    }
+    }  # Phase 13b: no "evaluation" section, so the task's default metrics apply
+    assert raw["task"] == {"type": "binary", "target": "label"}  # no positive_class
     assert raw["split"] == {
         "validation_ratio": 0.15,
         "test_ratio": 0.15,
@@ -673,9 +674,5 @@ def test_init_template_contains_only_supported_phase_sections(tmp_path: Path) ->
         {"name": "lightgbm", "family": "GBM", "params": {}},
         {"name": "random_forest", "family": "RF", "params": {}},
     ]
-    assert raw["evaluation"] == {
-        "primary_metric": "roc_auc",
-        "secondary_metrics": ["f1", "accuracy"],
-    }
-    assert raw["training"] == {"time_limit_seconds": None}
+    assert raw["training"] == {"time_limit_seconds": None, "seed": 42}
     assert raw["hpo"] == {"top_n": 3, "num_trials": 10, "time_limit_seconds": 300}

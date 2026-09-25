@@ -170,9 +170,10 @@ def _feature_set_entries(global_manifest: dict[str, Any]) -> list[dict[str, Any]
 def _expected_source_columns(
     spec: FeatureSetConfig,
     prepared_feature_columns: list[str],
+    id_columns: list[str],
 ) -> list[str]:
     if spec.source_columns == ["*"]:
-        return list(prepared_feature_columns)
+        return [column for column in prepared_feature_columns if column not in id_columns]
     return list(spec.source_columns)
 
 
@@ -193,7 +194,9 @@ def feature_set_recipe(
     return {
         "name": spec.name,
         "target": config.task.target,
-        "source_columns": _expected_source_columns(spec, prepared_feature_columns),
+        "source_columns": _expected_source_columns(
+            spec, prepared_feature_columns, config.data.id_columns
+        ),
         "plugin_inputs": list(spec.plugin_inputs),
         "plugins": [
             {

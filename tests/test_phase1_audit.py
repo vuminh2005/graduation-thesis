@@ -326,7 +326,8 @@ def test_multiclass_imbalance_warning_is_deterministic_and_nonfatal(
 ) -> None:
     dataset = tmp_path / "data.csv"
     labels = ["major"] * 18 + ["rare-a", "rare-b"]
-    pd.DataFrame({"feature": range(20), "label": labels}).to_csv(
+    # a float feature: all-distinct floats do not trigger the Phase 13b identifier warning
+    pd.DataFrame({"feature": [i * 0.5 for i in range(20)], "label": labels}).to_csv(
         dataset, index=False
     )
     config_path = write_config(

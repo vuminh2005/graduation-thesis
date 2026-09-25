@@ -8,7 +8,7 @@ import json
 import sys
 from pathlib import Path
 
-from mltool.config import ConfigError, MLToolConfig, load_config
+from mltool.config import SUPPORTED_TASKS, ConfigError, MLToolConfig, load_config
 from mltool.data import DataLoadError, load_dataset
 from mltool.feature_materialization import (
     FeatureMaterializationError,
@@ -117,14 +117,21 @@ CONFIG_TEMPLATE = '''schema_version: "0.1"
 project:
   name: {project_name}
 
+# To run: set task.type and task.target, put the data at data.path, `mltool run`.
 task:
-  type: binary
-  target: label
-  positive_class: 1
+  type: {task_type}  # binary | multiclass | regression
+  target: label  # the column to predict
+  # Binary only, optional: the class that counts as positive for roc_auc and f1.
+  # Unset: 1 for 0/1 labels, True for booleans, else the second label in sorted order.
+  # positive_class: 1
 
 data:
   format: auto
   path: ./data/dataset.csv
+  # Columns that identify rows rather than describe them (an id, a customer
+  # number): kept out of `source_columns: ["*"]` and copied into `mltool score`
+  # output. `mltool validate` warns about columns that look like identifiers.
+  # id_columns: [id]
 
 validation:
   enabled: true
@@ -172,14 +179,17 @@ models:
   #     num_bag_folds: 3
   #     num_stack_levels: 1
 
-evaluation:
-  primary_metric: roc_auc
-  secondary_metrics:
-    - f1
-    - accuracy
+# Metrics default per task.type: binary roc_auc (also f1, accuracy); multiclass
+# accuracy (also f1_macro); regression rmse (also mae, r2). To choose, uncomment;
+# secondary metrics left unset are the task's defaults minus the primary.
+# evaluation:
+#   primary_metric: roc_auc
+#   secondary_metrics: [f1, accuracy]
+#   cv: {{folds: 5, repeats: 1}}  # score candidates by cross-validation instead
 
 training:
   time_limit_seconds: null
+  seed: 42  # makes runs reproducible; null = AutoGluon's default seed
 
 # What `tune` searches and how long it may take; `mltool run` needs it too.
 hpo:
@@ -195,7 +205,9 @@ def _parser() -> argparse.ArgumentParser:
         description="Prepare feature experiments and train isolated AutoGluon candidates",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("init", help="create a minimal MLTool project")
+    init = subparsers.add_parser("init", help="create a minimal MLTool project")
+    init.add_argument("--task", choices=sorted(SUPPORTED_TASKS), default="binary",
+                      help="pre-fill task.type (default: binary)")
     run = subparsers.add_parser(
         "run", help="run every step from validate to register, skipping what is fresh"
     )
@@ -246,7 +258,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def init_project(directory: Path | None = None) -> int:
+def init_project(directory: Path | None = None, task: str = "binary") -> int:
     root = (directory or Path.cwd()).resolve()
     config_path = root / "mltool.yaml"
     if config_path.exists():
@@ -257,7 +269,8 @@ def init_project(directory: Path | None = None) -> int:
         (root / "data").mkdir(exist_ok=True)
         project_name = root.name or "mltool-project"
         config_path.write_text(
-            CONFIG_TEMPLATE.format(project_name=json.dumps(project_name)), encoding="utf-8"
+            CONFIG_TEMPLATE.format(project_name=json.dumps(project_name), task_type=task),
+            encoding="utf-8",
         )
     except OSError as exc:
         print(f"Error: could not initialize MLTool project: {exc}", file=sys.stderr)
@@ -642,7 +655,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "init":
-            return init_project()
+            return init_project(task=args.task)
         if args.command == "run":
             return run_project(dry_run=args.dry_run, until=args.until, refinalize=args.refinalize)
         if args.command == "validate":

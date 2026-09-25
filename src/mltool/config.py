@@ -529,7 +529,12 @@ def _evaluation_config(raw: dict[str, Any], task_type: str) -> EvaluationConfig:
     if not isinstance(primary, str) or not primary.strip():
         raise ConfigError('"evaluation.primary_metric" must be a non-empty string')
     primary = primary.strip()
-    secondary = evaluation_raw.get("secondary_metrics", default_secondary)
+    # Unset secondaries are the task's default secondaries minus the chosen
+    # primary (so `primary_metric: r2` alone is valid for regression). Any config
+    # that loaded before loads unchanged; an explicit duplicate is still an error.
+    secondary = evaluation_raw.get(
+        "secondary_metrics", [metric for metric in default_secondary if metric != primary]
+    )
     if not isinstance(secondary, list) or not all(
         isinstance(metric, str) and metric.strip() for metric in secondary
     ):

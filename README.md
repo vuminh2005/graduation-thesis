@@ -17,18 +17,36 @@ prepared test file only to fingerprint its bytes.
 
 ```bash
 mkdir demo && cd demo
-mltool init                       # writes mltool.yaml and data/
+mltool init --task regression     # or binary (the default) / multiclass
 cp /path/to/your.csv data/dataset.csv
-# edit mltool.yaml: task.type (binary / multiclass / regression) and task.target
+# edit mltool.yaml: task.target (and task.type if you did not pass --task)
 mltool run                        # validate -> prepare -> ... -> register
 mltool best                       # what was selected, and its test metrics
 mltool score --input new_rows.csv --output predictions.csv
 ```
 
+What a new user must edit, per task type, is the same two lines:
+
+| task | `task.type` | `task.target` | anything else |
+|---|---|---|---|
+| binary | `binary` (the default) | your label column | nothing; optionally `positive_class` (unset: 1 for 0/1 labels, `True` for booleans, else the second label in sorted order) |
+| multiclass | `multiclass` | your label column | nothing |
+| regression | `regression` | your numeric target | nothing |
+
+plus putting the data at `data.path` (`./data/dataset.csv`, CSV or Parquet).
+Metrics follow the task (binary `roc_auc`, multiclass `accuracy`, regression
+`rmse` as primary, with the others as secondaries); the template leaves
+`evaluation` commented out, and a primary you choose there is dropped from the
+default secondaries. `validate` warns about columns that look like row
+identifiers (named `id` / `*_id`, or an integer or text column with a distinct
+value in every row); uncomment `data.id_columns` to keep them out of the
+features.
+
 `init` writes a project that runs end to end as is: every column except the
-target becomes a feature, LightGBM and random forest are compared on a
-validation split, the best three candidates are tuned (`hpo:` section), and the
-winner is refit and evaluated once on the test split. Edit `mltool.yaml` to add
+target (and any `data.id_columns`) becomes a feature, LightGBM and random forest
+are compared on a validation split with `training.seed: 42`, the best three
+candidates are tuned (`hpo:` section), and the winner is refit and evaluated once
+on the test split. Edit `mltool.yaml` to add
 feature sets, models, cross-validation and so on (below), then `mltool run`
 again: it re-runs only the steps your edit made stale (see "One command:
 `mltool run`"). `mltool` here is `/path/to/graduation-thesis/.venv/bin/mltool`
@@ -711,9 +729,10 @@ preprocessor's training columns, or else the FeatureSet's); a missing one is a
 clear error, and a target column in the input is ignored. The output has the
 row identifiers declared in `data.id_columns` when the input has them, a
 `prediction` column, and one `proba_<class>` column per class for
-classification. `data.id_columns` (optional, default none) only affects this
-output; to keep an identifier out of the features, list `source_columns`
-explicitly instead of `"*"`. `score` writes nothing but its output file, so it
+classification. `data.id_columns` (optional, default none) names identifier
+columns: they are copied into this output and are never features of a
+`source_columns: ["*"]` FeatureSet (changing them changes that recipe, so the
+features become stale like any recipe edit). `score` writes nothing but its output file, so it
 is not recorded in the run history. All recorded artifact paths are relative to
 the directory of the file that records them, so a project or registry version
 can be moved or copied.

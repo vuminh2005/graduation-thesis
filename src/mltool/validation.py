@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import re
 from typing import Any
 
 import pandas as pd
@@ -122,6 +123,7 @@ def validate_dataset(config: MLToolConfig, dataset: LoadedDataset) -> Validation
             )
 
     _add_feature_warnings(report, frame, target_name=target_name)
+    _add_identifier_warnings(report, frame, target_name, config.data.id_columns)
     return report
 
 
@@ -156,6 +158,38 @@ def _add_imbalance_warning(
         report.warnings.append(
             f'class {minority_value!r} represents only {share:.1%} of non-null target values'
         )
+
+
+IDENTIFIER_NAME = re.compile(r"^(id|.*_id)$", re.IGNORECASE)
+
+
+def _add_identifier_warnings(
+    report: ValidationReport, frame: pd.DataFrame, target_name: str, id_columns: list[str]
+) -> None:
+    """Warn about columns that look like row identifiers but would be used as features.
+
+    A name such as ``id`` or ``*_id``, or an integer or text column whose values
+    are all distinct. Floats are left out: continuous features are often all
+    distinct. A warning only; ``data.id_columns`` keeps such a column out of
+    ``source_columns: ["*"]``.
+    """
+    if len(frame) < 2:
+        return
+    for name in frame.columns:
+        if name == target_name or name in id_columns or not isinstance(name, str):
+            continue
+        series = frame[name]
+        named = bool(IDENTIFIER_NAME.match(name))
+        kind = series.dtype.kind
+        distinct = (kind in "iu" or kind == "O" or isinstance(series.dtype, pd.StringDtype)) and (
+            series.notna().all() and series.is_unique
+        )
+        if named or distinct:
+            why = "is named like an identifier" if named else "has a distinct value in every row"
+            report.warnings.append(
+                f'column "{name}" {why}; if it identifies rows rather than describing them, '
+                "declare it in data.id_columns so it is not used as a feature"
+            )
 
 
 def _add_feature_warnings(

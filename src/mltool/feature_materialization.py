@@ -296,13 +296,16 @@ def _selected_source_columns(
     spec: FeatureSetConfig,
     available: list[str],
     target: str,
+    id_columns: list[str],
 ) -> list[str]:
     if spec.source_columns == ["*"]:
-        columns = [column for column in available if column != target]
+        # "*" is every feature: not the target and not a declared identifier
+        excluded = {target, *id_columns}
+        columns = [column for column in available if column not in excluded]
         if not columns:
             raise FeatureMaterializationError(
                 f'FeatureSet "{spec.name}" has no source columns; the dataset has no '
-                "columns other than the target"
+                "columns other than the target and data.id_columns"
             )
         return columns
     if target in spec.source_columns:
@@ -390,7 +393,7 @@ def build_feature_set_from_frames(
     target = config.task.target
     split_names = list(prepared_frames)
     available = prepared_frames[fit_split].columns.tolist()
-    source_columns = _selected_source_columns(spec, available, target)
+    source_columns = _selected_source_columns(spec, available, target, config.data.id_columns)
     # Extra columns the plugins read but that never become features, so a plugin
     # can replace a column rather than only add to it.
     extra_plugin_inputs = _selected_plugin_inputs(spec, available, target, source_columns)
